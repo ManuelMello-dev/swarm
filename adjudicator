@@ -1,0 +1,1157 @@
+"""JAX-native multi-agent proposal and adjudication loop with agent interaction.
+
+Agents first form independent proposals, then perform one round of soft
+communication (agent-to-agent attention) before the final heads and
+adjudication. Pure-JAX memory only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import ceil
+from typing import Any, Callable, NamedTuple, Optional
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import lax, random
+
+from jax_quantum_memory import JAXQuantumMemoryField, state_from_grid, FEATURE_DIM
+from qPSO_and_role_updates import (
+    init_qpso, qpso_step, role_rotation_update, QPSOState,
+)
+
+ARC_HYPOTHESIS_LABELS = (
+    "translation_or_motion",
+    "reflection_or_rotation",
+    "recoloring",
+    "object_count_or_shape",
+    "symmetry_or_repetition",
+    "sequence_or_periodicity",
+    "object_interaction_or_mechanics",
+    "unknown_or_other",
+)
+
+
+@dataclass(frozen=True)
+class SwarmConfig:
+    max_agents: int = 32
+    min_agents: int = 2
+    chunk_size: int = 8
+    grid_side: int = 16
+    hidden_dim: int = 64
+    num_hypotheses: int = 8
+    num_actions: int = 6
+    num_colors: int = 10
+    graph_capacity: int = 128
+    retrieval_top_k: int = 8
+    memory_budget_mb: float = 256.0
+    cross_task_weight: float = 0.25
+    use_phi_drift: bool = True
+    policy_learning_rate: float = 0.025
+    reliability_learning_rate: float = 0.05
+    value_learning_rate: float = 0.005
+    prediction_learning_rate: float = 0.001
+    baseline_decay: float = 0.95
+    quantum_memory_dim: int = 32
+    quantum_memory_capacity: int = 1000
+    quantum_memory_top_k: int = 5
+    seed: int = 0
+    num_roles: int = 4
+    qpso_particles: int = 6
+    qpso_every: int = 4
+    qpso_beta: float = 0.7
+    qpso_init_scale: float = 0.03
+    rotation_every: int = 2
+    rotation_theta_max: float = 0.06
+
+    def __post_init__(self) -> None:
+        positive = {
+            "max_agents": self.max_agents, "min_agents": self.min_agents,
+            "chunk_size": self.chunk_size, "grid_side": self.grid_side,
+            "hidden_dim": self.hidden_dim, "num_hypotheses": self.num_hypotheses,
+            "num_actions": self.num_actions, "num_colors": self.num_colors,
+            "graph_capacity": self.graph_capacity, "retrieval_top_k": self.retrieval_top_k,
+            "quantum_memory_dim": self.quantum_memory_dim,
+            "quantum_memory_capacity": self.quantum_memory_capacity,
+            "quantum_memory_top_k": self.quantum_memory_top_k,
+            "num_roles": self.num_roles, "qpso_particles": self.qpso_particles,
+            "qpso_every": self.qpso_every, "rotation_every": self.rotation_every,
+        }
+        bad = [name for name, value in positive.items() if value <= 0]
+        if bad:
+            raise ValueError(f"positive configuration values required: {', '.join(bad)}")
+        if self.min_agents > self.max_agents:
+            raise ValueError("min_agents cannot exceed max_agents")
+        if self.retrieval_top_k > self.graph_capacity:
+            raise ValueError("retrieval_top_k cannot exceed graph_capacity")
+        if self.num_actions != 6:
+            raise ValueError("ARC proposal head currently supports exactly ACTION1..ACTION6")
+        if self.num_colors != 10:
+            raise ValueError("ARC palette must contain exactly 10 colors")
+        if self.memory_budget_mb <= 0:
+            raise ValueError("memory_budget_mb must be positive")
+        for name in (
+            "cross_task_weight", "policy_learning_rate", "reliability_learning_rate",
+            "value_learning_rate", "prediction_learning_rate", "baseline_decay",
+            "qpso_beta", "qpso_init_scale", "rotation_theta_max",
+        ):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+
+    @property
+    def patch_count(self) -> int:
+        return self.grid_side * self.grid_side
+
+    @property
+    def hypothesis_labels(self) -> tuple[str, ...]:
+        base = list(ARC_HYPOTHESIS_LABELS[: self.num_hypotheses])
+        base.extend(f"hypothesis_{i}" for i in range(len(base), self.num_hypotheses))
+        return tuple(base)
+
+
+class SwarmParams(NamedTuple):
+    token_projection: jax.Array
+    global_projection: jax.Array
+    graph_projection: jax.Array
+    key_projection: jax.Array
+    query_projection: jax.Array
+    recurrent_projection: jax.Array
+    evidence_projection: jax.Array
+    action_projection: jax.Array
+    action_effect: jax.Array
+    hypothesis_projection: jax.Array
+    coordinate_projection: jax.Array
+    confidence_projection: jax.Array
+    change_projection: jax.Array
+    color_projection: jax.Array
+    agent_identity: jax.Array
+    agent_action_bias: jax.Array
+    agent_role_bias: jax.Array
+    baseline_weights: jax.Array
+    baseline_bias: jax.Array
+    # communication layer
+    comm_query: jax.Array
+    comm_key: jax.Array
+    comm_value: jax.Array
+    comm_gate: jax.Array
+
+
+class MacroGraphState(NamedTuple):
+    embeddings: jax.Array
+    attention_maps: jax.Array
+    hypothesis_probs: jax.Array
+    predicted_change_probs: jax.Array
+    predicted_color_probs: jax.Array
+    actions: jax.Array
+    rewards: jax.Array
+    confidences: jax.Array
+    task_ids: jax.Array
+    step_ids: jax.Array
+    observed_next_colors: jax.Array
+    prediction_errors: jax.Array
+    has_next_observation: jax.Array
+    edges: jax.Array
+    valid: jax.Array
+    cursor: jax.Array
+    count: jax.Array
+
+
+class SwarmState(NamedTuple):
+    agent_hidden: jax.Array
+    reliability: jax.Array
+    reward_baseline: jax.Array
+    last_disagreement: jax.Array
+    step_count: jax.Array
+    graph: MacroGraphState
+
+
+class ProposalBatch(NamedTuple):
+    active_mask: jax.Array
+    attention: jax.Array
+    hypothesis_probs: jax.Array
+    action_probs: jax.Array
+    action_values: jax.Array
+    proposed_actions: jax.Array
+    coordinates: jax.Array
+    confidence: jax.Array
+    predicted_change_probs: jax.Array
+    predicted_color_probs: jax.Array
+    agent_hidden: jax.Array
+    current_colors: jax.Array
+    state_embedding: jax.Array
+    retrieval_score: jax.Array
+
+
+class Adjudication(NamedTuple):
+    action_index: jax.Array
+    coordinates: jax.Array
+    action_scores: jax.Array
+    confidence: jax.Array
+    disagreement: jax.Array
+    winning_agent: jax.Array
+    attention: jax.Array
+    hypothesis_probs: jax.Array
+    predicted_change_probs: jax.Array
+    predicted_color_probs: jax.Array
+
+
+class PendingRound(NamedTuple):
+    proposals: ProposalBatch
+    adjudication: Adjudication
+    task_id: jax.Array
+    state_embedding: jax.Array
+
+
+@dataclass(frozen=True)
+class Decision:
+    action_id: int
+    action_index: int
+    coordinates: Optional[tuple[int, int]]
+    active_agents: int
+    hardware_agent_cap: int
+    confidence: float
+    disagreement: float
+    winning_agent: int
+    action_scores: tuple[float, ...]
+    hypothesis_id: int
+    hypothesis_label: str
+    hypothesis_confidence: float
+    attention_map: np.ndarray
+    hypothesis_probs: np.ndarray
+    predicted_change_map: np.ndarray
+    predicted_grid: np.ndarray
+    proposals: ProposalBatch
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    reward: float
+    next_grid: Optional[Any] = None
+    done: bool = False
+
+
+def estimate_working_set_bytes(config: SwarmConfig, agent_count: int) -> int:
+    if agent_count < 1:
+        return 2**63 - 1
+    pad = int(ceil(agent_count / config.chunk_size) * config.chunk_size)
+    p, h, k, c, g, a = (
+        config.patch_count, config.hidden_dim, config.num_hypotheses,
+        config.num_colors, config.graph_capacity, config.num_actions,
+    )
+    graph_elements = g * (h + 2 * p + p * c + k + 12) + g * g
+    shared_elements = (
+        (c + 2) * h
+        + (2 * h + c + 2 * config.quantum_memory_dim + 10) * h
+        + (h + p + k) * h
+        + 4 * h * h
+        + h * a + a * h + h * k + 2 * h + h + h * p + h * p * c
+        + pad * (h + a + k)
+        + h + 1
+        + 4 * h * h  # communication
+    )
+    per_agent_elements = h * 2 + p * 2 + p * c + k + 3 * a + a * p + a * p * c + 4
+    proposal_elements = pad * per_agent_elements
+    token_elements = p * (c + 2 + h)
+    return int(2 * (4 * (graph_elements + shared_elements + proposal_elements + token_elements)))
+
+
+def _padded_count(agent_count: int, chunk_size: int) -> int:
+    return int(ceil(agent_count / chunk_size) * chunk_size)
+
+
+def _agent_cap_for_budget(config: SwarmConfig) -> int:
+    limit = int(config.memory_budget_mb * 1024 * 1024)
+    for count in range(config.max_agents, config.min_agents - 1, -1):
+        if estimate_working_set_bytes(config, count) <= limit:
+            return count
+    return 0
+
+
+def choose_active_count(
+    novelty: float, uncertainty: float, disagreement: float,
+    legal_action_count: int, minimum: int, maximum: int, num_actions: int = 6,
+) -> int:
+    if minimum < 1 or maximum < minimum:
+        raise ValueError("require 1 <= minimum <= maximum")
+    clamp = lambda v: float(np.clip(float(v), 0.0, 1.0))
+    branch = (max(1, min(num_actions, int(legal_action_count))) - 1) / max(1, num_actions - 1)
+    demand = (
+        0.30 * clamp(novelty) + 0.30 * clamp(uncertainty)
+        + 0.25 * clamp(disagreement) + 0.15 * clamp(branch)
+    )
+    return int(np.clip(minimum + round((maximum - minimum) * demand), minimum, maximum))
+
+
+def _init_params(key: jax.Array, config: SwarmConfig, padded: int) -> SwarmParams:
+    h, p, k, c, a = (
+        config.hidden_dim, config.patch_count, config.num_hypotheses,
+        config.num_colors, config.num_actions,
+    )
+    keys = random.split(key, 22)
+
+    def mat(i: int, rows: int, cols: int) -> jax.Array:
+        return random.normal(keys[i], (rows, cols), dtype=jnp.float32) / jnp.sqrt(float(max(1, rows)))
+
+    role_ids = jnp.arange(padded) % config.num_roles
+    role_bias_table = random.normal(keys[15], (config.num_roles, k), dtype=jnp.float32) * 0.3
+    agent_role_bias = role_bias_table[role_ids]
+
+    return SwarmParams(
+        token_projection=mat(0, c + 2, h),
+        global_projection=mat(1, 2 * h + c + 2 * config.quantum_memory_dim + 10, h),
+        graph_projection=mat(2, h + p + k, h),
+        key_projection=mat(3, h, h),
+        query_projection=mat(4, h, h),
+        recurrent_projection=mat(5, h, h),
+        evidence_projection=mat(6, h, h),
+        action_projection=mat(7, h, a),
+        action_effect=mat(14, a, h),
+        hypothesis_projection=mat(8, h, k),
+        coordinate_projection=mat(9, h, 2),
+        confidence_projection=mat(10, h, 1),
+        change_projection=mat(11, h, p),
+        color_projection=mat(12, h, p * c),
+        agent_identity=random.normal(keys[13], (padded, h), dtype=jnp.float32) * 0.08,
+        agent_action_bias=jnp.zeros((padded, a), dtype=jnp.float32),
+        agent_role_bias=agent_role_bias,
+        baseline_weights=jnp.zeros((h,), dtype=jnp.float32),
+        baseline_bias=jnp.array(0.0, dtype=jnp.float32),
+        comm_query=mat(16, h, h),
+        comm_key=mat(17, h, h),
+        comm_value=mat(18, h, h),
+        comm_gate=mat(19, h, h),
+    )
+
+
+def _empty_graph(config: SwarmConfig) -> MacroGraphState:
+    g, h, p, k, c = (
+        config.graph_capacity, config.hidden_dim, config.patch_count,
+        config.num_hypotheses, config.num_colors,
+    )
+    return MacroGraphState(
+        embeddings=jnp.zeros((g, h), jnp.float32),
+        attention_maps=jnp.zeros((g, p), jnp.float32),
+        hypothesis_probs=jnp.zeros((g, k), jnp.float32),
+        predicted_change_probs=jnp.zeros((g, p), jnp.float32),
+        predicted_color_probs=jnp.zeros((g, p, c), jnp.float32),
+        actions=jnp.full((g,), -1, jnp.int32),
+        rewards=jnp.zeros((g,), jnp.float32),
+        confidences=jnp.zeros((g,), jnp.float32),
+        task_ids=jnp.full((g,), -1, jnp.int32),
+        step_ids=jnp.full((g,), -1, jnp.int32),
+        observed_next_colors=jnp.full((g, p), -1, jnp.int32),
+        prediction_errors=jnp.zeros((g,), jnp.float32),
+        has_next_observation=jnp.zeros((g,), jnp.bool_),
+        edges=jnp.zeros((g, g), jnp.bool_),
+        valid=jnp.zeros((g,), jnp.bool_),
+        cursor=jnp.array(0, jnp.int32),
+        count=jnp.array(0, jnp.int32),
+    )
+
+
+def _empty_state(config: SwarmConfig, padded: int) -> SwarmState:
+    return SwarmState(
+        agent_hidden=jnp.zeros((padded, config.hidden_dim), jnp.float32),
+        reliability=jnp.ones((padded,), jnp.float32),
+        reward_baseline=jnp.array(0.0, jnp.float32),
+        last_disagreement=jnp.array(0.0, jnp.float32),
+        step_count=jnp.array(0, jnp.int32),
+        graph=_empty_graph(config),
+    )
+
+
+def _grid_tokens(grid: jax.Array, config: SwarmConfig) -> tuple[jax.Array, jax.Array]:
+    values = jnp.asarray(grid, dtype=jnp.float32)
+    values = jnp.nan_to_num(values, nan=0.0, posinf=9.0, neginf=0.0)
+    resized = jax.image.resize(values, (config.grid_side, config.grid_side), method="nearest")
+    colors = jnp.clip(jnp.rint(resized), 0, config.num_colors - 1).astype(jnp.int32)
+    one_hot = jax.nn.one_hot(colors, config.num_colors, dtype=jnp.float32)
+    axis = jnp.linspace(-1.0, 1.0, config.grid_side, dtype=jnp.float32)
+    yy, xx = jnp.meshgrid(axis, axis, indexing="ij")
+    xy = jnp.stack((xx, yy), axis=-1)
+    token_inputs = jnp.concatenate((one_hot, xy), axis=-1)
+    return token_inputs.reshape((config.patch_count, config.num_colors + 2)), colors
+
+
+def _read_macrograph(graph, query, task_id, config):
+    eps = jnp.array(1e-8, jnp.float32)
+    q = query / (jnp.linalg.norm(query) + eps)
+    nodes = graph.embeddings / (jnp.linalg.norm(graph.embeddings, axis=-1, keepdims=True) + eps)
+    similarity = nodes @ q
+    scope = jnp.where(graph.task_ids == task_id, 1.0, config.cross_task_weight)
+    scores = jnp.where(graph.valid, similarity * scope, -1e9)
+    top_values, top_indices = lax.top_k(scores, config.retrieval_top_k)
+    selected_valid = graph.valid[top_indices]
+    top_weights = jax.nn.softmax(jnp.where(selected_valid, top_values, -1e9))
+    top_weights = top_weights * selected_valid.astype(jnp.float32)
+    top_weights = top_weights / (jnp.sum(top_weights) + eps)
+    direct = jnp.zeros((config.graph_capacity,), jnp.float32).at[top_indices].add(top_weights)
+    neighbors = (direct @ graph.edges.astype(jnp.float32)) * graph.valid.astype(jnp.float32)
+    neighbors = neighbors / (jnp.sum(neighbors) + eps)
+    mixed = (direct + 0.25 * neighbors) * graph.valid.astype(jnp.float32)
+    mixed = mixed / (jnp.sum(mixed) + eps)
+    embedding_context = mixed @ graph.embeddings
+    attention_context = mixed @ graph.attention_maps
+    hypothesis_context = mixed @ graph.hypothesis_probs
+    has_memory = (jnp.sum(top_weights) > 0).astype(jnp.float32)
+    best_similarity = jnp.max(jnp.where(selected_valid, top_values, -1e9))
+    retrieval_score = jnp.where(has_memory > 0, jnp.clip(best_similarity, 0.0, 1.0), 0.0)
+    attention_context = jnp.where(
+        has_memory > 0,
+        attention_context / (jnp.sum(attention_context) + eps),
+        jnp.full((config.patch_count,), 1.0 / config.patch_count, jnp.float32),
+    )
+    hypothesis_context = jnp.where(
+        has_memory > 0,
+        hypothesis_context / (jnp.sum(hypothesis_context) + eps),
+        jnp.full((config.num_hypotheses,), 1.0 / config.num_hypotheses, jnp.float32),
+    )
+    return embedding_context, attention_context, hypothesis_context, retrieval_score
+
+
+def _agent_communicate(hiddens: jax.Array, active_mask: jax.Array, params: SwarmParams) -> jax.Array:
+    """One round of soft agent-to-agent attention."""
+    queries = hiddens @ params.comm_query
+    keys    = hiddens @ params.comm_key
+    values  = hiddens @ params.comm_value
+    scale = jnp.sqrt(jnp.asarray(hiddens.shape[-1], jnp.float32))
+    logits = (queries @ keys.T) / scale
+    logits = jnp.where(active_mask[None, :], logits, -1e9)
+    attn = jax.nn.softmax(logits, axis=-1)
+    messages = attn @ values
+    gate = jax.nn.sigmoid(hiddens @ params.comm_gate)
+    return hiddens + gate * messages
+
+
+def _propose_kernel(
+    params: SwarmParams,
+    state: SwarmState,
+    grid: jax.Array,
+    legal_mask: jax.Array,
+    task_id: jax.Array,
+    novelty: jax.Array,
+    uncertainty: jax.Array,
+    memory_features: jax.Array,
+    active_count: jax.Array,
+    config: SwarmConfig,
+    padded: int,
+) -> ProposalBatch:
+    p, h, k, c, a = (
+        config.patch_count, config.hidden_dim, config.num_hypotheses,
+        config.num_colors, config.num_actions,
+    )
+    token_inputs, current_colors = _grid_tokens(grid, config)
+    token_features = token_inputs @ params.token_projection
+    color_hist = jnp.mean(token_inputs[:, :c], axis=0)
+    global_features = jnp.concatenate((
+        jnp.mean(token_features, axis=0),
+        jnp.max(token_features, axis=0),
+        color_hist,
+        memory_features,
+        jnp.asarray([novelty, uncertainty], jnp.float32),
+    ))
+    raw_embedding = jnp.tanh(global_features @ params.global_projection)
+    graph_embedding, graph_attention, graph_hypotheses, retrieval_score = _read_macrograph(
+        state.graph, raw_embedding, task_id, config
+    )
+    graph_features = jnp.concatenate((graph_embedding, graph_attention, graph_hypotheses))
+    shared = jnp.tanh(raw_embedding + graph_features @ params.graph_projection)
+    keys = token_features @ params.key_projection
+    prior_bias = jnp.log(graph_attention + 1e-6) * (0.15 * retrieval_score)
+    hyp_prior = jnp.log(graph_hypotheses + 1e-6) * (0.15 * retrieval_score)
+    scale = jnp.sqrt(jnp.asarray(h, jnp.float32))
+    offsets = jnp.arange(config.chunk_size, dtype=jnp.int32)
+
+    def one_agent(index, previous_hidden, identity, action_bias, role_bias):
+        base = jnp.tanh(shared + previous_hidden @ params.recurrent_projection + identity)
+        query = base @ params.query_projection
+        attention_logits = (keys @ query) / scale + prior_bias
+        attention = jax.nn.softmax(attention_logits)
+        evidence = attention @ token_features
+        hidden = jnp.tanh(base + evidence @ params.evidence_projection)
+        return attention, hidden
+
+    # Pass 1: independent hiddens
+    initial_h = jnp.zeros((padded, h), jnp.float32)
+    initial_attn = jnp.zeros((padded, p), jnp.float32)
+    num_chunks = (active_count + config.chunk_size - 1) // config.chunk_size
+
+    def chunk_body(chunk_number, carry):
+        hiddens, attns = carry
+        start = chunk_number * config.chunk_size
+        indices = start + offsets
+        safe = jnp.minimum(indices, padded - 1)
+        attn_chunk, hid_chunk = jax.vmap(one_agent)(
+            safe,
+            state.agent_hidden[safe],
+            params.agent_identity[safe],
+            params.agent_action_bias[safe],
+            params.agent_role_bias[safe],
+        )
+        active = indices < active_count
+        hid_chunk = jnp.where(active[:, None], hid_chunk, 0.0)
+        attn_chunk = jnp.where(active[:, None], attn_chunk, 0.0)
+        hiddens = lax.dynamic_update_slice(hiddens, hid_chunk, (start, 0))
+        attns = lax.dynamic_update_slice(attns, attn_chunk, (start, 0))
+        return hiddens, attns
+
+    hiddens, attentions = lax.fori_loop(0, num_chunks, chunk_body, (initial_h, initial_attn))
+    active_mask = jnp.arange(padded) < active_count
+
+    # Interaction
+    hiddens = _agent_communicate(hiddens, active_mask, params)
+
+    # Pass 2: heads on interacted hiddens
+    def heads(hidden, role_bias, action_bias):
+        action_values = hidden @ params.action_projection + action_bias
+        masked_values = jnp.where(legal_mask, action_values, -1e9)
+        action_probs = jax.nn.softmax(masked_values)
+        proposed_action = jnp.argmax(masked_values).astype(jnp.int32)
+        hypothesis_logits = hidden @ params.hypothesis_projection + hyp_prior + role_bias
+        hypothesis_probs = jax.nn.softmax(hypothesis_logits)
+        coordinates = jax.nn.sigmoid(hidden @ params.coordinate_projection)
+        confidence_head = jax.nn.sigmoid((hidden @ params.confidence_projection).squeeze(-1))
+        confidence = jnp.clip(
+            confidence_head * jnp.sqrt(jnp.max(hypothesis_probs) * jnp.max(action_probs)),
+            0.0, 1.0,
+        )
+        action_conditioned = jnp.tanh(hidden[None, :] + params.action_effect)
+        change_probs = jax.nn.sigmoid(action_conditioned @ params.change_projection)
+        color_logits = (action_conditioned @ params.color_projection).reshape((a, p, c))
+        color_probs = jax.nn.softmax(color_logits, axis=-1)
+        return (
+            hypothesis_probs, action_probs, action_values, proposed_action,
+            coordinates, confidence, change_probs, color_probs,
+        )
+
+    hyp, act_p, act_v, prop, coord, conf, chg, col = jax.vmap(heads)(
+        hiddens, params.agent_role_bias, params.agent_action_bias
+    )
+
+    hyp = jnp.where(active_mask[:, None], hyp, 0.0)
+    act_p = jnp.where(active_mask[:, None], act_p, 0.0)
+    act_v = jnp.where(active_mask[:, None], act_v, 0.0)
+    prop = jnp.where(active_mask, prop, -1)
+    coord = jnp.where(active_mask[:, None], coord, 0.0)
+    conf = jnp.where(active_mask, conf, 0.0)
+    chg = jnp.where(active_mask[:, None, None], chg, 0.0)
+    col = jnp.where(active_mask[:, None, None, None], col, 0.0)
+
+    return ProposalBatch(
+        active_mask=active_mask,
+        attention=attentions,
+        hypothesis_probs=hyp,
+        action_probs=act_p,
+        action_values=act_v,
+        proposed_actions=prop,
+        coordinates=coord,
+        confidence=conf,
+        predicted_change_probs=chg,
+        predicted_color_probs=col,
+        agent_hidden=hiddens,
+        current_colors=current_colors.reshape((p,)),
+        state_embedding=raw_embedding,
+        retrieval_score=retrieval_score,
+    )
+
+
+def _adjudicate_kernel(
+    proposals: ProposalBatch,
+    reliability: jax.Array,
+    legal_mask: jax.Array,
+    config: SwarmConfig,
+) -> Adjudication:
+    active = proposals.active_mask.astype(jnp.float32)
+    weights = reliability * proposals.confidence * active
+    weights = weights / (jnp.sum(weights) + 1e-8)
+
+    action_scores = jnp.sum(weights[:, None] * proposals.action_probs, axis=0)
+    action_scores = jnp.where(legal_mask, action_scores, -1e9)
+    action_index = jnp.argmax(action_scores).astype(jnp.int32)
+
+    # Soft-vote entropy + hard-vote gap as disagreement
+    soft = jax.nn.softmax(action_scores)
+    entropy = -jnp.sum(soft * jnp.log(soft + 1e-8))
+    top2 = lax.top_k(action_scores, 2)[0]
+    gap = top2[0] - top2[1]
+    disagreement = jnp.clip(entropy / jnp.log(jnp.asarray(config.num_actions, jnp.float32)) * (1.0 - gap), 0.0, 1.0)
+
+    # Winning agent (highest weight among those who proposed the chosen action)
+    chose_it = (proposals.proposed_actions == action_index) & proposals.active_mask
+    win_scores = jnp.where(chose_it, weights, -1e9)
+    winning_agent = jnp.argmax(win_scores).astype(jnp.int32)
+
+    # Aggregate maps
+    attention = jnp.sum(weights[:, None] * proposals.attention, axis=0)
+    attention = attention / (jnp.sum(attention) + 1e-8)
+    hypothesis_probs = jnp.sum(weights[:, None] * proposals.hypothesis_probs, axis=0)
+    hypothesis_probs = hypothesis_probs / (jnp.sum(hypothesis_probs) + 1e-8)
+
+    # Predicted change/color for the chosen action
+    change = proposals.predicted_change_probs[:, action_index, :]
+    color = proposals.predicted_color_probs[:, action_index, :, :]
+    predicted_change = jnp.sum(weights[:, None] * change, axis=0)
+    predicted_color = jnp.sum(weights[:, None, None] * color, axis=0)
+
+    coordinates = proposals.coordinates[winning_agent]
+    confidence = jnp.sum(weights * proposals.confidence)
+
+    return Adjudication(
+        action_index=action_index,
+        coordinates=coordinates,
+        action_scores=action_scores,
+        confidence=confidence,
+        disagreement=disagreement,
+        winning_agent=winning_agent,
+        attention=attention,
+        hypothesis_probs=hypothesis_probs,
+        predicted_change_probs=predicted_change,
+        predicted_color_probs=predicted_color,
+    )
+
+
+def _write_graph(
+    graph: MacroGraphState,
+    proposals: ProposalBatch,
+    decision: Adjudication,
+    action: jax.Array,
+    reward: jax.Array,
+    task_id: jax.Array,
+    step_id: jax.Array,
+    next_colors: jax.Array,
+    prediction_error: jax.Array,
+    has_next: jax.Array,
+    config: SwarmConfig,
+) -> MacroGraphState:
+    g = config.graph_capacity
+    slot = graph.cursor
+    old_valid = graph.valid
+
+    # Connect to similar previous nodes + previous step of same task
+    eps = 1e-8
+    normalized = proposals.state_embedding / (jnp.linalg.norm(proposals.state_embedding) + eps)
+    node_embeddings = graph.embeddings / (jnp.linalg.norm(graph.embeddings, axis=-1, keepdims=True) + eps)
+    similarities = node_embeddings @ normalized
+    similarities = jnp.where(old_valid, similarities, -1e9)
+    values, indices = lax.top_k(similarities, config.retrieval_top_k)
+    connect = jnp.zeros((g,), jnp.bool_).at[indices].set((values > 0.10) & old_valid[indices])
+    previous_steps = jnp.where(old_valid & (graph.task_ids == task_id), graph.step_ids, -1)
+    previous_index = jnp.argmax(previous_steps).astype(jnp.int32)
+    has_previous = jnp.max(previous_steps) >= 0
+    connect = connect.at[previous_index].set(connect[previous_index] | has_previous)
+    connect = connect.at[slot].set(False)
+    edges = graph.edges.at[slot, :].set(connect)
+    edges = edges.at[:, slot].set(connect)
+    edges = edges.at[slot, slot].set(False)
+
+    return graph._replace(
+        embeddings=graph.embeddings.at[slot].set(proposals.state_embedding),
+        attention_maps=graph.attention_maps.at[slot].set(decision.attention),
+        hypothesis_probs=graph.hypothesis_probs.at[slot].set(decision.hypothesis_probs),
+        predicted_change_probs=graph.predicted_change_probs.at[slot].set(decision.predicted_change_probs),
+        predicted_color_probs=graph.predicted_color_probs.at[slot].set(decision.predicted_color_probs),
+        actions=graph.actions.at[slot].set(action),
+        rewards=graph.rewards.at[slot].set(reward),
+        confidences=graph.confidences.at[slot].set(decision.confidence),
+        task_ids=graph.task_ids.at[slot].set(task_id),
+        step_ids=graph.step_ids.at[slot].set(step_id),
+        observed_next_colors=graph.observed_next_colors.at[slot].set(
+            jnp.where(has_next, next_colors, -1)
+        ),
+        prediction_errors=graph.prediction_errors.at[slot].set(prediction_error),
+        has_next_observation=graph.has_next_observation.at[slot].set(has_next),
+        edges=edges,
+        valid=graph.valid.at[slot].set(True),
+        cursor=(slot + 1) % g,
+        count=jnp.minimum(graph.count + 1, g),
+    )
+
+
+def _feedback_kernel(
+    params: SwarmParams,
+    state: SwarmState,
+    pending: PendingRound,
+    reward: jax.Array,
+    next_colors: jax.Array,
+    has_next: jax.Array,
+    config: SwarmConfig,
+) -> tuple[SwarmParams, SwarmState, jax.Array, jax.Array]:
+    proposals, decision, task_id, state_embedding = pending
+    eps = jnp.array(1e-8, jnp.float32)
+    action = decision.action_index
+    active = proposals.active_mask.astype(jnp.float32)
+
+    # Reliability update
+    predicted_reward = proposals.action_values[:, action]
+    reward_fit = jnp.exp(-jnp.clip(jnp.abs(predicted_reward - reward), 0.0, 8.0))
+    color_for_action = proposals.predicted_color_probs[:, action, :, :]
+    safe_next = jnp.clip(next_colors, 0, config.num_colors - 1)
+    target_probs = jnp.take_along_axis(
+        color_for_action,
+        jnp.broadcast_to(safe_next[None, :, None], (color_for_action.shape[0], config.patch_count, 1)),
+        axis=-1,
+    ).squeeze(-1)
+    per_agent_ce = jnp.where(has_next, jnp.mean(-jnp.log(jnp.maximum(target_probs, eps)), axis=-1), 0.0)
+    prediction_fit = jnp.clip(jnp.exp(-per_agent_ce) * config.num_colors, 0.0, 1.0)
+    fit = jnp.where(has_next, 0.5 * reward_fit + 0.5 * prediction_fit, reward_fit)
+    reliability = (1.0 - config.reliability_learning_rate) * state.reliability + (
+        config.reliability_learning_rate * fit * active
+    )
+    reliability = jnp.where(proposals.active_mask, reliability, state.reliability)
+    reliability = jnp.clip(reliability, 0.01, 1.0)
+
+    # Policy / value / forecast updates
+    advantage = jnp.clip(reward - state.reward_baseline, -1.0, 1.0)
+    chosen_one_hot = jax.nn.one_hot(action, config.num_actions)
+    policy_gradient = advantage * (chosen_one_hot[None, :] - proposals.action_probs)
+    bias_update = config.policy_learning_rate * policy_gradient * active[:, None]
+
+    def value_loss(action_projection):
+        values = proposals.agent_hidden @ action_projection + params.agent_action_bias
+        errors = values[:, action] - reward
+        return 0.5 * jnp.sum(jnp.square(errors) * active) / (jnp.sum(active) + eps)
+
+    value_gradient = jax.grad(value_loss)(params.action_projection)
+
+    def forecast_loss(action_effect, color_projection, change_projection):
+        conditioned = jnp.tanh(proposals.agent_hidden + action_effect[action][None, :])
+        color_logits = (conditioned @ color_projection).reshape(
+            (proposals.active_mask.shape[0], config.patch_count, config.num_colors)
+        )
+        log_probs = jax.nn.log_softmax(color_logits, axis=-1)
+        color_targets = jnp.broadcast_to(safe_next[None, :, None], (proposals.active_mask.shape[0], config.patch_count, 1))
+        color_ce = -jnp.take_along_axis(log_probs, color_targets, axis=-1).squeeze(-1)
+        change_targets = (safe_next != proposals.current_colors).astype(jnp.float32)
+        change_logits = conditioned @ change_projection
+        change_bce = jax.nn.softplus(change_logits) - change_targets[None, :] * change_logits
+        per_agent = jnp.mean(color_ce, axis=-1) + 0.5 * jnp.mean(change_bce, axis=-1)
+        return jnp.sum(per_agent * active) / (jnp.sum(active) + eps)
+
+    forecast_grads = jax.grad(forecast_loss, argnums=(0, 1, 2))(
+        params.action_effect, params.color_projection, params.change_projection
+    )
+    forecast_rate = config.prediction_learning_rate * has_next.astype(jnp.float32)
+
+    params = params._replace(
+        action_projection=params.action_projection - config.value_learning_rate * value_gradient,
+        action_effect=params.action_effect - forecast_rate * forecast_grads[0],
+        color_projection=params.color_projection - forecast_rate * forecast_grads[1],
+        change_projection=params.change_projection - forecast_rate * forecast_grads[2],
+        agent_action_bias=params.agent_action_bias + bias_update,
+    )
+
+    baseline = config.baseline_decay * state.reward_baseline + (1.0 - config.baseline_decay) * reward
+    prediction_error = jnp.sum(per_agent_ce * active) / (jnp.sum(active) + eps)
+
+    # Surprise for emotional encoding
+    surprise = jnp.clip(jnp.abs(reward - state.reward_baseline) + prediction_error, 0.0, 1.0)
+
+    graph = _write_graph(
+        state.graph, proposals, decision, action, reward, task_id,
+        state.step_count, next_colors, prediction_error, has_next, config,
+    )
+    state = state._replace(
+        reliability=reliability,
+        reward_baseline=baseline,
+        last_disagreement=decision.disagreement,
+        step_count=state.step_count + 1,
+        graph=graph,
+    )
+    return params, state, prediction_error, surprise
+
+
+def _legal_action_mask(actions: Any, num_actions: int = 6) -> np.ndarray:
+    if isinstance(actions, np.ndarray) and actions.dtype == np.bool_:
+        mask = actions.astype(bool, copy=False)
+        if mask.shape != (num_actions,):
+            raise ValueError(f"boolean legal-action mask must have shape ({num_actions},)")
+        return mask.copy()
+    if isinstance(actions, (list, tuple)) and actions and all(isinstance(x, (bool, np.bool_)) for x in actions):
+        mask = np.asarray(actions, dtype=bool)
+        if mask.shape != (num_actions,):
+            raise ValueError(f"boolean legal-action mask must have shape ({num_actions},)")
+        return mask
+    if actions is None:
+        raise ValueError("legal_actions is required")
+    try:
+        items = list(actions)
+    except TypeError as exc:
+        raise ValueError("legal_actions must be action IDs, names, or a six-element boolean mask") from exc
+    mask = np.zeros((num_actions,), dtype=bool)
+    for item in items:
+        if isinstance(item, str):
+            name = item.strip().upper()
+            if not name.startswith("ACTION") or not name[6:].isdigit():
+                raise ValueError(f"unsupported action name: {item!r}")
+            action_id = int(name[6:])
+        elif isinstance(item, (int, np.integer)) and not isinstance(item, (bool, np.bool_)):
+            action_id = int(item)
+        else:
+            raise ValueError(f"unsupported legal action entry: {item!r}")
+        if not 1 <= action_id <= num_actions:
+            raise ValueError(f"only ARC ACTION1..ACTION{num_actions} are supported")
+        mask[action_id - 1] = True
+    if not mask.any():
+        raise ValueError("at least one legal ACTION1..ACTION6 is required")
+    return mask
+
+
+def _validated_grid(grid: Any) -> np.ndarray:
+    arr = np.asarray(grid)
+    if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+        raise ValueError(f"grid must be a non-empty two-dimensional array; got {arr.shape}")
+    arr = np.nan_to_num(arr, nan=0.0, posinf=9.0, neginf=0.0)
+    return np.clip(np.rint(arr), 0, 9).astype(np.int32)
+
+
+class JAXProposalSwarm:
+    """Stateful host wrapper with agent interaction."""
+
+    def __init__(self, config: SwarmConfig = SwarmConfig()) -> None:
+        self.config = config
+        self.hardware_agent_cap = _agent_cap_for_budget(config)
+        if self.hardware_agent_cap < config.min_agents:
+            minimum_bytes = estimate_working_set_bytes(config, config.min_agents)
+            raise MemoryError(
+                f"memory_budget_mb={config.memory_budget_mb} cannot fit the minimum "
+                f"{config.min_agents}-agent swarm (estimated {minimum_bytes / 1048576:.3f} MiB)"
+            )
+        self.padded_agent_count = _padded_count(self.hardware_agent_cap, config.chunk_size)
+        self.params = _init_params(random.PRNGKey(config.seed), config, self.padded_agent_count)
+        self.state = _empty_state(config, self.padded_agent_count)
+        self.quantum_memory = JAXQuantumMemoryField(
+            dim=config.quantum_memory_dim,
+            capacity=config.quantum_memory_capacity,
+            top_k=config.quantum_memory_top_k,
+            cross_task_weight=config.cross_task_weight,
+            use_phi_drift=config.use_phi_drift,
+            seed=config.seed + 1,
+        )
+        self._pending: Optional[PendingRound] = None
+        self._pre_proposal_state: Optional[SwarmState] = None
+        self._pending_memory_amplitudes: Optional[jax.Array] = None
+        self.last_memory_features = jnp.zeros(2 * config.quantum_memory_dim + 8, jnp.float32)
+        self.last_decision: Optional[Decision] = None
+
+        # QPSO + role rotation
+        self.num_roles = config.num_roles
+        role_bias_dim = config.num_roles * config.num_hypotheses
+        baseline_dim = config.hidden_dim + 1
+        self.qpso_param_dim = role_bias_dim + baseline_dim
+        self.qpso = init_qpso(
+            random.PRNGKey(config.seed + 99),
+            param_dim=self.qpso_param_dim,
+            n_particles=config.qpso_particles,
+            init_scale=config.qpso_init_scale,
+        )
+        self.qpso = self.qpso._replace(beta=jnp.asarray(config.qpso_beta, dtype=jnp.float32))
+        self.role_fitness = jnp.zeros((config.num_roles,), dtype=jnp.float32)
+        self.prev_role_fitness = jnp.zeros((config.num_roles,), dtype=jnp.float32)
+        self._qpso_key = random.PRNGKey(config.seed + 123)
+        self._qpso_steps = 0
+        self.qpso_every = config.qpso_every
+        self.rotation_every = config.rotation_every
+        self.rotation_theta_max = config.rotation_theta_max
+
+        self._propose_jit = jax.jit(
+            lambda params, state, grid, legal, task, novelty, uncertainty, memory, count:
+                _propose_kernel(params, state, grid, legal, task, novelty, uncertainty,
+                                memory, count, config, self.padded_agent_count)
+        )
+        self._adjudicate_jit = jax.jit(
+            lambda proposals, reliability, legal:
+                _adjudicate_kernel(proposals, reliability, legal, config)
+        )
+        self._feedback_jit = jax.jit(
+            lambda params, state, pending, reward, colors, has_next:
+                _feedback_kernel(params, state, pending, reward, colors, has_next, config)
+        )
+
+    def choose_active_agents(self, novelty, uncertainty, disagreement, legal_action_count):
+        return choose_active_count(
+            novelty, uncertainty, disagreement, legal_action_count,
+            self.config.min_agents, self.hardware_agent_cap, self.config.num_actions,
+        )
+
+    def propose(self, grid, legal_actions, task_id, novelty=0.0, uncertainty=0.0) -> Decision:
+        if self._pending is not None:
+            raise RuntimeError("observe_outcome or cancel_pending is required before another proposal")
+        grid_np = _validated_grid(grid)
+        legal_np = _legal_action_mask(legal_actions, self.config.num_actions)
+        task_id = int(task_id)
+        novelty = float(np.clip(novelty, 0.0, 1.0))
+        uncertainty = float(np.clip(uncertainty, 0.0, 1.0))
+        active_count = self.choose_active_agents(
+            novelty, uncertainty, float(jax.device_get(self.state.last_disagreement)), int(legal_np.sum())
+        )
+        self._pre_proposal_state = self.state
+        grid_jax = jnp.asarray(grid_np, dtype=jnp.int32)
+        legal_jax = jnp.asarray(legal_np, dtype=jnp.bool_)
+        phase = self.state.step_count.astype(jnp.float32)
+
+        memory_amplitudes = self.quantum_memory.encode_grid(grid_jax)
+        memory_features, _, _ = self.quantum_memory.recall(
+            memory_amplitudes, phase, jnp.asarray(task_id, jnp.int32)
+        )
+        self.last_memory_features = memory_features
+        self._pending_memory_amplitudes = memory_amplitudes
+
+        proposals = self._propose_jit(
+            self.params, self.state, grid_jax, legal_jax,
+            jnp.asarray(task_id, jnp.int32),
+            jnp.asarray(novelty, jnp.float32),
+            jnp.asarray(uncertainty, jnp.float32),
+            jnp.asarray(memory_features, jnp.float32),
+            jnp.asarray(active_count, jnp.int32),
+        )
+        adjudication = self._adjudicate_jit(proposals, self.state.reliability, legal_jax)
+
+        proposed_hidden = jnp.where(
+            proposals.active_mask[:, None], proposals.agent_hidden, self.state.agent_hidden
+        )
+        self.state = self.state._replace(
+            agent_hidden=proposed_hidden,
+            last_disagreement=adjudication.disagreement,
+        )
+        self._pending = PendingRound(
+            proposals=proposals,
+            adjudication=adjudication,
+            task_id=jnp.asarray(task_id, jnp.int32),
+            state_embedding=proposals.state_embedding,
+        )
+
+        action_index = int(jax.device_get(adjudication.action_index))
+        if not legal_np[action_index]:
+            self.cancel_pending()
+            raise RuntimeError("internal safety failure: adjudicator selected an illegal action")
+
+        coordinates = None
+        if action_index == 5:
+            xy = np.asarray(jax.device_get(adjudication.coordinates))
+            coordinates = (
+                int(np.clip(np.rint(float(xy[0]) * 63), 0, 63)),
+                int(np.clip(np.rint(float(xy[1]) * 63), 0, 63)),
+            )
+
+        active_count = int(np.asarray(jax.device_get(proposals.active_mask)).sum())
+        attention_map = np.asarray(jax.device_get(adjudication.attention)).reshape(
+            self.config.grid_side, self.config.grid_side
+        )
+        hypotheses = np.asarray(jax.device_get(adjudication.hypothesis_probs))
+        change_map = np.asarray(jax.device_get(adjudication.predicted_change_probs)).reshape(
+            self.config.grid_side, self.config.grid_side
+        )
+        color_probs = np.asarray(jax.device_get(adjudication.predicted_color_probs))
+        predicted_grid = np.argmax(color_probs, axis=-1).reshape(
+            self.config.grid_side, self.config.grid_side
+        ).astype(np.int32)
+
+        decision = Decision(
+            action_id=action_index + 1,
+            action_index=action_index,
+            coordinates=coordinates,
+            active_agents=active_count,
+            hardware_agent_cap=self.hardware_agent_cap,
+            confidence=float(jax.device_get(adjudication.confidence)),
+            disagreement=float(jax.device_get(adjudication.disagreement)),
+            winning_agent=int(jax.device_get(adjudication.winning_agent)),
+            action_scores=tuple(float(x) for x in np.asarray(jax.device_get(adjudication.action_scores))),
+            hypothesis_id=int(np.argmax(hypotheses)),
+            hypothesis_label=self.config.hypothesis_labels[int(np.argmax(hypotheses))],
+            hypothesis_confidence=float(np.max(hypotheses)),
+            attention_map=attention_map,
+            hypothesis_probs=hypotheses,
+            predicted_change_map=change_map,
+            predicted_grid=predicted_grid,
+            proposals=proposals,
+        )
+        self.last_decision = decision
+        return decision
+
+    def observe_outcome(self, reward: float, next_grid=None, task_id=None) -> dict:
+        if self._pending is None:
+            raise RuntimeError("there is no pending decision to learn from")
+        pending = self._pending
+        if task_id is not None and int(task_id) != int(jax.device_get(pending.task_id)):
+            raise ValueError("outcome task_id does not match the pending decision")
+        if not np.isfinite(float(reward)):
+            raise ValueError("reward must be finite")
+
+        if next_grid is None:
+            next_colors = jnp.full((self.config.patch_count,), -1, jnp.int32)
+            has_next = jnp.asarray(False)
+        else:
+            _, color_ids = _grid_tokens(jnp.asarray(_validated_grid(next_grid)), self.config)
+            next_colors = color_ids.reshape((self.config.patch_count,))
+            has_next = jnp.asarray(True)
+
+        new_params, new_state, prediction_error, surprise = self._feedback_jit(
+            self.params, self.state, pending,
+            jnp.asarray(float(reward), jnp.float32),
+            next_colors, has_next,
+        )
+
+        # Quantum memory encode with surprise-modulated weight
+        memory_amplitudes = self._pending_memory_amplitudes
+        decision = pending.adjudication
+        emotional = float(np.clip(0.15 + 0.85 * float(jax.device_get(surprise)), 0.0, 1.0))
+        memory_state_after = self.quantum_memory.candidate_encode(
+            memory_amplitudes,
+            int(jax.device_get(decision.action_index)) + 1,
+            float(reward),
+            int(jax.device_get(pending.task_id)),
+            float(jax.device_get(self.state.step_count)),
+            emotional,
+        )
+        self.params, self.state = new_params, new_state
+        self.quantum_memory.state = memory_state_after
+
+        # Role fitness + rotation + QPSO (same as before)
+        self._qpso_steps += 1
+        surprise_f = float(jax.device_get(surprise))
+        reward_f = float(reward)
+        active = np.asarray(jax.device_get(pending.proposals.active_mask))
+        conf = np.asarray(jax.device_get(pending.proposals.confidence))
+        role_ids = np.arange(self.padded_agent_count) % self.num_roles
+        for r in range(self.num_roles):
+            mask = (role_ids == r) & active
+            if mask.any():
+                self.role_fitness = self.role_fitness.at[r].set(
+                    0.9 * self.role_fitness[r] + 0.1 * (conf[mask].mean() + 0.5 * reward_f)
+                )
+
+        if self._qpso_steps % self.rotation_every == 0:
+            role_bias_table = self.params.agent_role_bias[: self.num_roles]
+            updated_table = role_rotation_update(
+                role_bias_table, self.role_fitness, self.prev_role_fitness,
+                theta_max=self.rotation_theta_max,
+            )
+            new_role_bias = updated_table[role_ids]
+            self.params = self.params._replace(agent_role_bias=new_role_bias)
+            self.prev_role_fitness = self.role_fitness
+
+        if self._qpso_steps % self.qpso_every == 0:
+            self._qpso_key, subkey = random.split(self._qpso_key)
+            role_bias_table = self.params.agent_role_bias[: self.num_roles]
+            current_vec = jnp.concatenate([
+                role_bias_table.reshape(-1),
+                self.params.baseline_weights,
+                self.params.baseline_bias[None],
+            ])
+            pos = self.qpso.particles.position.at[0].set(current_vec)
+            self.qpso = self.qpso._replace(particles=self.qpso.particles._replace(position=pos))
+
+            emb = pending.state_embedding
+            chosen_hyp = int(jax.device_get(jnp.argmax(pending.adjudication.hypothesis_probs)))
+
+            def _particle_fitness(vec):
+                rb_dim = self.num_roles * self.config.num_hypotheses
+                rtable = vec[:rb_dim].reshape(self.num_roles, self.config.num_hypotheses)
+                bw = vec[rb_dim:rb_dim + self.config.hidden_dim]
+                bb = vec[-1]
+                pred = jnp.dot(emb, bw) + bb
+                baseline_term = -jnp.abs(pred - reward_f)
+                alignment = 0.0
+                for r in range(self.num_roles):
+                    pref = jax.nn.softmax(rtable[r])[chosen_hyp]
+                    alignment = alignment + pref
+                alignment = alignment / max(1, self.num_roles)
+                return baseline_term + 0.5 * alignment + (reward_f - 0.5 * surprise_f)
+
+            fitness = jax.vmap(_particle_fitness)(self.qpso.particles.position)
+            self.qpso = qpso_step(self.qpso, fitness, subkey)
+
+            gbest = self.qpso.global_best
+            rb_dim = self.num_roles * self.config.num_hypotheses
+            new_role_table = gbest[:rb_dim].reshape(self.num_roles, self.config.num_hypotheses)
+            new_baseline_w = gbest[rb_dim:rb_dim + self.config.hidden_dim]
+            new_baseline_b = gbest[-1]
+            new_role_bias = new_role_table[role_ids]
+            self.params = self.params._replace(
+                agent_role_bias=new_role_bias,
+                baseline_weights=new_baseline_w,
+                baseline_bias=new_baseline_b,
+            )
+
+        self._pending = None
+        self._pre_proposal_state = None
+        self._pending_memory_amplitudes = None
+        return {
+            "step": int(jax.device_get(self.state.step_count)),
+            "graph_nodes": int(jax.device_get(self.state.graph.count)),
+            "mean_reliability": float(jax.device_get(jnp.mean(self.state.reliability))),
+            "prediction_cross_entropy": float(jax.device_get(prediction_error)),
+            "reward_baseline": float(jax.device_get(self.state.reward_baseline)),
+            "surprise": float(jax.device_get(surprise)),
+            "qpso_generation": int(jax.device_get(self.qpso.generation)),
+            "qpso_best_fitness": float(jax.device_get(self.qpso.global_best_fitness)),
+        }
+
+    def cancel_pending(self) -> None:
+        if self._pending is None:
+            return
+        if self._pre_proposal_state is not None:
+            self.state = self._pre_proposal_state
+        self._pending = None
+        self._pre_proposal_state = None
+        self._pending_memory_amplitudes = None
+        self.last_decision = None
+
+    def reset_episode(self, preserve_graph: bool = True, preserve_reliability: bool = True) -> None:
+        if self._pending is not None:
+            raise RuntimeError("resolve or cancel the pending action before resetting")
+        graph = self.state.graph if preserve_graph else _empty_graph(self.config)
+        reliability = self.state.reliability if preserve_reliability else jnp.ones_like(self.state.reliability)
+        self.state = self.state._replace(
+            agent_hidden=jnp.zeros_like(self.state.agent_hidden),
+            reliability=reliability,
+            reward_baseline=jnp.array(0.0, jnp.float32),
+            last_disagreement=jnp.array(0.0, jnp.float32),
+            graph=graph,
+        )
+        self.last_decision = None
+
+    def step(self, grid, legal_actions, task_id, execute_action, parse_outcome,
+             novelty=0.0, uncertainty=0.0):
+        decision = self.propose(grid, legal_actions, task_id, novelty, uncertainty)
+        try:
+            raw_outcome = execute_action(decision.action_id, decision.coordinates)
+            parsed = parse_outcome(raw_outcome)
+            if isinstance(parsed, ExecutionResult):
+                reward, next_grid = parsed.reward, parsed.next_grid
+            else:
+                reward, next_grid = parsed
+            feedback = self.observe_outcome(reward, next_grid, task_id=task_id)
+            return decision, raw_outcome, feedback
+        except Exception:
+            self.cancel_pending()
+            raise
+
+
+def main() -> None:
+    swarm = JAXProposalSwarm(SwarmConfig(max_agents=16, min_agents=2, seed=7))
+    grid = np.zeros((12, 14), np.int32)
+    grid[3:8, 5:10] = 4
+    decision = swarm.propose(
+        grid,
+        legal_actions=["ACTION1", "ACTION2", "ACTION6"],
+        task_id=1,
+        novelty=0.7,
+        uncertainty=0.6,
+    )
+    print({
+        "action": f"ACTION{decision.action_id}",
+        "coordinates": decision.coordinates,
+        "active_agents": decision.active_agents,
+        "confidence": round(decision.confidence, 4),
+        "disagreement": round(decision.disagreement, 4),
+        "hypothesis_distribution": np.round(decision.hypothesis_probs, 3).tolist(),
+    })
+    feedback = swarm.observe_outcome(reward=0.5, next_grid=grid, task_id=1)
+    print({"feedback": feedback, "macro_graph_nodes": int(swarm.state.graph.count)})
+
+
+if __name__ == "__main__":
+    main()
