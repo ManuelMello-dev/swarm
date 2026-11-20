@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax, random
 
-from jax_quantum_memory import JAXQuantumMemoryField, state_from_grid, FEATURE_DIM
+from jax_quantum_memory import JAXQuantumMemoryField
 from qPSO_and_role_updates import (
     init_qpso, qpso_step, role_rotation_update, QPSOState,
 )
@@ -56,6 +56,8 @@ class SwarmConfig:
     quantum_memory_dim: int = 32
     quantum_memory_capacity: int = 1000
     quantum_memory_top_k: int = 5
+    quantum_projection_learning_rate: float = 0.005
+    quantum_projection_update_every: int = 8
     seed: int = 0
     num_roles: int = 4
     qpso_particles: int = 6
@@ -75,6 +77,7 @@ class SwarmConfig:
             "quantum_memory_dim": self.quantum_memory_dim,
             "quantum_memory_capacity": self.quantum_memory_capacity,
             "quantum_memory_top_k": self.quantum_memory_top_k,
+            "quantum_projection_update_every": self.quantum_projection_update_every,
             "num_roles": self.num_roles, "qpso_particles": self.qpso_particles,
             "qpso_every": self.qpso_every, "rotation_every": self.rotation_every,
         }
@@ -91,10 +94,13 @@ class SwarmConfig:
             raise ValueError("ARC palette must contain exactly 10 colors")
         if self.memory_budget_mb <= 0:
             raise ValueError("memory_budget_mb must be positive")
+        if self.quantum_projection_learning_rate <= 0:
+            raise ValueError("quantum_projection_learning_rate must be positive")
         for name in (
             "cross_task_weight", "policy_learning_rate", "reliability_learning_rate",
             "value_learning_rate", "prediction_learning_rate", "baseline_decay",
-            "qpso_beta", "qpso_init_scale", "rotation_theta_max",
+            "quantum_projection_learning_rate", "qpso_beta", "qpso_init_scale",
+            "rotation_theta_max",
         ):
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
@@ -832,6 +838,7 @@ class JAXProposalSwarm:
         self._pending: Optional[PendingRound] = None
         self._pre_proposal_state: Optional[SwarmState] = None
         self._pending_memory_amplitudes: Optional[jax.Array] = None
+        self._pending_memory_features: Optional[jax.Array] = None
         self.last_memory_features = jnp.zeros(2 * config.quantum_memory_dim + 8, jnp.float32)
         self.last_decision: Optional[Decision] = None
 
@@ -891,12 +898,13 @@ class JAXProposalSwarm:
         legal_jax = jnp.asarray(legal_np, dtype=jnp.bool_)
         phase = self.state.step_count.astype(jnp.float32)
 
-        memory_amplitudes = self.quantum_memory.encode_grid(grid_jax)
+        grid_features, memory_amplitudes = self.quantum_memory.encode_grid_with_features(grid_jax)
         memory_features, _, _ = self.quantum_memory.recall(
             memory_amplitudes, phase, jnp.asarray(task_id, jnp.int32)
         )
         self.last_memory_features = memory_features
         self._pending_memory_amplitudes = memory_amplitudes
+        self._pending_memory_features = grid_features
 
         proposals = self._propose_jit(
             self.params, self.state, grid_jax, legal_jax,
@@ -1004,12 +1012,24 @@ class JAXProposalSwarm:
             int(jax.device_get(pending.task_id)),
             float(jax.device_get(self.state.step_count)),
             emotional,
+            features=self._pending_memory_features,
         )
         self.params, self.state = new_params, new_state
         self.quantum_memory.state = memory_state_after
 
         # Role fitness + rotation + QPSO (same as before)
         self._qpso_steps += 1
+        projection_loss = jnp.asarray(0.0, jnp.float32)
+        projection_grad_norm = jnp.asarray(0.0, jnp.float32)
+        projection_updated = jnp.asarray(False)
+        if self._qpso_steps % self.config.quantum_projection_update_every == 0:
+            projection_loss, projection_grad_norm, projection_updated = (
+                self.quantum_memory.update_projection(
+                    self._pending_memory_features,
+                    int(jax.device_get(pending.task_id)),
+                    self.config.quantum_projection_learning_rate,
+                )
+            )
         surprise_f = float(jax.device_get(surprise))
         reward_f = float(reward)
         active = np.asarray(jax.device_get(pending.proposals.active_mask))
@@ -1078,6 +1098,7 @@ class JAXProposalSwarm:
         self._pending = None
         self._pre_proposal_state = None
         self._pending_memory_amplitudes = None
+        self._pending_memory_features = None
         return {
             "step": int(jax.device_get(self.state.step_count)),
             "graph_nodes": int(jax.device_get(self.state.graph.count)),
@@ -1087,6 +1108,9 @@ class JAXProposalSwarm:
             "surprise": float(jax.device_get(surprise)),
             "qpso_generation": int(jax.device_get(self.qpso.generation)),
             "qpso_best_fitness": float(jax.device_get(self.qpso.global_best_fitness)),
+            "projection_updated": bool(jax.device_get(projection_updated)),
+            "projection_loss": float(jax.device_get(projection_loss)),
+            "projection_grad_norm": float(jax.device_get(projection_grad_norm)),
         }
 
     def cancel_pending(self) -> None:
@@ -1097,6 +1121,7 @@ class JAXProposalSwarm:
         self._pending = None
         self._pre_proposal_state = None
         self._pending_memory_amplitudes = None
+        self._pending_memory_features = None
         self.last_decision = None
 
     def reset_episode(self, preserve_graph: bool = True, preserve_reliability: bool = True) -> None:
