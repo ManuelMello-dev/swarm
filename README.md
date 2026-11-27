@@ -24,6 +24,8 @@ QPSO is scored on a new sample each generation, so stored personal and global be
 
 The agent trunk now learns. Recurrence (`recurrent_projection`), token attention (`query_projection`, `key_projection`, `evidence_projection`), and agent-to-agent communication (`comm_query`, `comm_key`, `comm_value`, `comm_gate`) are trained by backpropagating the value, forecast (when the next grid is observed), and click losses through a recomputation of the trunk at feedback time. The proposal keeps the trunk inputs it used, and proposal and feedback call the same trunk function, so the recomputed hiddens match the proposed ones exactly. The update uses `trunk_learning_rate` (default 0.002; 0 freezes the trunk) with a joint gradient-norm clip `trunk_grad_clip_norm` (default 1.0). Feedback reports `trunk_loss` and `trunk_grad_norm`. Measured cost on CPU with the default config: about 35 ms per step versus 32 ms without trunk learning.
 
+Surprise, which sets each memory's emotional weight, is `|reward - baseline| + prediction_error / ln(10)`, clipped to [0, 1]. Dividing the colour cross-entropy by ln 10 (its chance-level value for 10 colours) keeps prediction error from saturating surprise on its own, so emotional weights spread as forecasting improves.
+
 ## Tests
 
 Run the CPU JAX tests with:

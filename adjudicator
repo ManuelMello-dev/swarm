@@ -877,8 +877,15 @@ def _feedback_kernel(
     baseline = config.baseline_decay * state.reward_baseline + (1.0 - config.baseline_decay) * reward
     prediction_error = jnp.sum(per_agent_ce * active) / (jnp.sum(active) + eps)
 
-    # Surprise for emotional encoding
-    surprise = jnp.clip(jnp.abs(reward - value_baseline) + prediction_error, 0.0, 1.0)
+    # Surprise for emotional encoding. Prediction error is colour cross-entropy;
+    # dividing by ln(num_colors) (= ln 10, chance-level CE) puts it on a 0..~1
+    # scale so it does not saturate surprise on its own.
+    normalized_prediction_error = prediction_error / jnp.log(
+        jnp.asarray(config.num_colors, jnp.float32)
+    )
+    surprise = jnp.clip(
+        jnp.abs(reward - value_baseline) + normalized_prediction_error, 0.0, 1.0
+    )
 
     graph = _write_graph(
         state.graph, proposals, decision, action, reward, task_id,

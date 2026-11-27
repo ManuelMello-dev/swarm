@@ -85,6 +85,19 @@ class TrunkLearningTests(unittest.TestCase):
         swarm.observe_outcome(reward=1.0, next_grid=np.zeros((4, 4), np.int32), task_id=1)
         np.testing.assert_array_equal(np.asarray(swarm.params.comm_query), before)
 
+    def test_surprise_scales_prediction_error_by_ln10(self):
+        swarm = adjudicator.JAXProposalSwarm(config())
+        swarm.propose(np.ones((4, 4), np.int32), legal_actions=[1, 2], task_id=1)
+        pending, params, state = swarm._pending, swarm.params, swarm.state
+        # Initial baseline is EMA 0 + residual 0, so reward 0 isolates the prediction term.
+        _, _, prediction_error, surprise, _ = swarm._feedback_jit(
+            params, state, pending, jnp.asarray(0.0, jnp.float32),
+            jnp.zeros((16,), jnp.int32), jnp.asarray(True),
+        )
+        expected = min(1.0, float(prediction_error) / np.log(10.0))
+        self.assertAlmostEqual(float(surprise), expected, places=5)
+        swarm.cancel_pending()
+
 
 if __name__ == "__main__":
     unittest.main()
