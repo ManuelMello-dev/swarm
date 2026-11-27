@@ -6,7 +6,7 @@ in a separate module so the main adjudicator stays readable.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -56,6 +56,8 @@ def qpso_step(
     state: QPSOState,
     fitness: jax.Array,          # [N] fitness of current positions (higher = better)
     key: jax.Array,
+    personal_best_fitness: Optional[jax.Array] = None,  # [N] re-evaluated pbest fitness
+    global_best_fitness: Optional[jax.Array] = None,    # scalar re-evaluated gbest fitness
 ) -> QPSOState:
     """One generation of QPSO (mean-best attractor version).
 
@@ -63,11 +65,24 @@ def qpso_step(
         mbest = mean(personal_best)
         p = φ * pbest + (1-φ) * gbest
         x ← p ± β * |mbest - x| * ln(1/u)
+
+    When the objective is non-stationary (each generation scored on a new
+    sample), pass the current-sample fitness of the stored personal and global
+    bests so comparisons are like-for-like instead of against stale scores.
     """
     N, D = state.particles.position.shape
     pos = state.particles.position
     pbest = state.particles.personal_best
-    pbest_fit = state.particles.personal_best_fitness
+    pbest_fit = (
+        state.particles.personal_best_fitness
+        if personal_best_fitness is None
+        else jnp.asarray(personal_best_fitness, jnp.float32)
+    )
+    prior_gfit = (
+        state.global_best_fitness
+        if global_best_fitness is None
+        else jnp.asarray(global_best_fitness, jnp.float32)
+    )
 
     # Update personal and global bests
     improved = fitness > pbest_fit
@@ -77,8 +92,8 @@ def qpso_step(
     best_idx = jnp.argmax(new_pbest_fit)
     candidate_gbest = new_pbest[best_idx]
     candidate_gfit = new_pbest_fit[best_idx]
-    new_gbest = jnp.where(candidate_gfit > state.global_best_fitness, candidate_gbest, state.global_best)
-    new_gfit = jnp.maximum(candidate_gfit, state.global_best_fitness)
+    new_gbest = jnp.where(candidate_gfit > prior_gfit, candidate_gbest, state.global_best)
+    new_gfit = jnp.maximum(candidate_gfit, prior_gfit)
 
     # Mean best position
     mbest = jnp.mean(new_pbest, axis=0)

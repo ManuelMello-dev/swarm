@@ -47,7 +47,7 @@ class ComponentConnectionTests(unittest.TestCase):
         has_next = jnp.asarray(True)
         base, *_ = swarm._feedback_jit(params, state, pending, reward, colors, has_next)
         shifted = params._replace(baseline_bias=params.baseline_bias + 0.5)
-        moved, _, _, surprise = swarm._feedback_jit(shifted, state, pending, reward, colors, has_next)
+        moved, _, _, surprise, _ = swarm._feedback_jit(shifted, state, pending, reward, colors, has_next)
         self.assertFalse(np.allclose(base.agent_action_bias, moved.agent_action_bias))
         self.assertTrue(np.isfinite(float(surprise)))
         swarm.cancel_pending()
@@ -100,6 +100,62 @@ class ComponentConnectionTests(unittest.TestCase):
         self.assertEqual(feedback["qpso_generation"], 4)
         for key in ("mean_reliability", "reward_baseline", "surprise", "qpso_best_fitness"):
             self.assertTrue(np.isfinite(feedback[key]), key)
+
+
+
+class CoordinateAndQPSOTests(unittest.TestCase):
+    def _coords(self, swarm, params, state, grid):
+        out = swarm._propose_jit(params, state, *propose_args(swarm, grid))
+        return np.asarray(out.coordinates[:2])
+
+    def test_click_coordinates_move_toward_observed_change(self):
+        swarm = adjudicator.JAXProposalSwarm(small_config(coordinate_learning_rate=0.5))
+        grid = np.zeros((4, 4), np.int32)
+        changed = grid.copy()
+        changed[3, 3] = 5  # bottom-right cell changes -> target (1.0, 1.0)
+        target = np.array([1.0, 1.0])
+        initial_params = swarm.params
+        for _ in range(6):
+            decision = swarm.propose(grid, legal_actions=[6], task_id=2)
+            self.assertEqual(decision.action_id, 6)
+            feedback = swarm.observe_outcome(reward=0.0, next_grid=changed, task_id=2)
+            self.assertEqual(feedback["coordinate_update_weight"], 1.0)
+        before = self._coords(swarm, initial_params, swarm.state, grid)
+        after = self._coords(swarm, swarm.params, swarm.state, grid)
+        self.assertLess(
+            np.linalg.norm(after - target, axis=-1).mean(),
+            np.linalg.norm(before - target, axis=-1).mean(),
+        )
+
+    def test_coordinates_untouched_when_not_clicking(self):
+        swarm = adjudicator.JAXProposalSwarm(small_config())
+        grid = np.zeros((4, 4), np.int32)
+        before = np.asarray(swarm.params.coordinate_projection).copy()
+        swarm.propose(grid, legal_actions=[1], task_id=2)
+        feedback = swarm.observe_outcome(reward=1.0, next_grid=grid + 1, task_id=2)
+        self.assertEqual(feedback["coordinate_update_weight"], 0.0)
+        np.testing.assert_array_equal(np.asarray(swarm.params.coordinate_projection), before)
+
+    def test_qpso_uses_refreshed_best_fitness(self):
+        import jax
+        from qPSO_and_role_updates import init_qpso, qpso_step
+        state = init_qpso(jax.random.PRNGKey(0), param_dim=3, n_particles=2)
+        stale = state._replace(
+            particles=state.particles._replace(personal_best_fitness=jnp.array([100.0, 100.0])),
+            global_best_fitness=jnp.asarray(100.0),
+        )
+        fitness = jnp.array([1.0, 2.0])
+        key = jax.random.PRNGKey(1)
+        frozen = qpso_step(stale, fitness, key)
+        np.testing.assert_array_equal(frozen.particles.personal_best_fitness, [100.0, 100.0])
+        refreshed = qpso_step(
+            stale, fitness, key,
+            personal_best_fitness=jnp.array([0.0, 0.0]),
+            global_best_fitness=jnp.asarray(0.0),
+        )
+        np.testing.assert_array_equal(refreshed.particles.personal_best_fitness, [1.0, 2.0])
+        self.assertEqual(float(refreshed.global_best_fitness), 2.0)
+        np.testing.assert_array_equal(refreshed.global_best, stale.particles.position[1])
 
 
 if __name__ == "__main__":
