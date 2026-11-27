@@ -22,6 +22,8 @@ ACTION6 click coordinates now learn. After a click, if the next grid is observed
 
 QPSO is scored on a new sample each generation, so stored personal and global bests are re-scored on the current sample before comparison (`qpso_step(..., personal_best_fitness=, global_best_fitness=)`), preventing an early lucky score from locking the global best.
 
+The agent trunk now learns. Recurrence (`recurrent_projection`), token attention (`query_projection`, `key_projection`, `evidence_projection`), and agent-to-agent communication (`comm_query`, `comm_key`, `comm_value`, `comm_gate`) are trained by backpropagating the value, forecast (when the next grid is observed), and click losses through a recomputation of the trunk at feedback time. The proposal keeps the trunk inputs it used, and proposal and feedback call the same trunk function, so the recomputed hiddens match the proposed ones exactly. The update uses `trunk_learning_rate` (default 0.002; 0 freezes the trunk) with a joint gradient-norm clip `trunk_grad_clip_norm` (default 1.0). Feedback reports `trunk_loss` and `trunk_grad_norm`. Measured cost on CPU with the default config: about 35 ms per step versus 32 ms without trunk learning.
+
 ## Tests
 
 Run the CPU JAX tests with:

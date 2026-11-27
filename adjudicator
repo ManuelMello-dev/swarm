@@ -54,6 +54,8 @@ class SwarmConfig:
     value_learning_rate: float = 0.005
     prediction_learning_rate: float = 0.001
     coordinate_learning_rate: float = 0.05
+    trunk_learning_rate: float = 0.002
+    trunk_grad_clip_norm: float = 1.0
     baseline_decay: float = 0.95
     quantum_memory_dim: int = 32
     quantum_memory_capacity: int = 1000
@@ -98,11 +100,13 @@ class SwarmConfig:
             raise ValueError("memory_budget_mb must be positive")
         if self.quantum_projection_learning_rate <= 0:
             raise ValueError("quantum_projection_learning_rate must be positive")
+        if self.trunk_grad_clip_norm <= 0:
+            raise ValueError("trunk_grad_clip_norm must be positive")
         for name in (
             "cross_task_weight", "graph_action_prior_weight",
             "policy_learning_rate", "reliability_learning_rate",
             "value_learning_rate", "prediction_learning_rate", "coordinate_learning_rate",
-            "baseline_decay",
+            "trunk_learning_rate", "baseline_decay",
             "quantum_projection_learning_rate", "qpso_beta", "qpso_init_scale",
             "rotation_theta_max",
         ):
@@ -193,6 +197,19 @@ class ProposalBatch(NamedTuple):
     state_embedding: jax.Array
     retrieval_score: jax.Array
     action_prior: jax.Array
+    # Trunk inputs retained so feedback can recompute the agent trunk with gradients.
+    trunk_shared: jax.Array      # [h]
+    trunk_tokens: jax.Array      # [p, h]
+    trunk_prior: jax.Array       # [p]
+    trunk_previous: jax.Array    # [padded, h]
+
+
+# Weights of the agent trunk (recurrence, token attention, agent communication)
+# trained by backpropagating the feedback losses through the recomputed trunk.
+TRUNK_FIELDS = (
+    "recurrent_projection", "query_projection", "key_projection", "evidence_projection",
+    "comm_query", "comm_key", "comm_value", "comm_gate",
+)
 
 
 class Adjudication(NamedTuple):
@@ -265,7 +282,11 @@ def estimate_working_set_bytes(config: SwarmConfig, agent_count: int) -> int:
     per_agent_elements = h * 2 + p * 2 + p * c + k + 3 * a + a * p + a * p * c + 4
     proposal_elements = pad * per_agent_elements
     token_elements = p * (c + 2 + h)
-    return int(2 * (4 * (graph_elements + shared_elements + proposal_elements + token_elements)))
+    # Retained trunk inputs plus gradient recomputation (~3x trunk activations).
+    trunk_elements = 3 * (p * h + p + h + pad * (2 * h + p)) + 8 * h * h
+    return int(2 * (4 * (
+        graph_elements + shared_elements + proposal_elements + token_elements + trunk_elements
+    )))
 
 
 def _padded_count(agent_count: int, chunk_size: int) -> int:
@@ -449,6 +470,37 @@ def _agent_communicate(hiddens: jax.Array, active_mask: jax.Array, params: Swarm
     return hiddens + gate * messages
 
 
+def _agent_trunk_step(
+    params: SwarmParams,
+    shared: jax.Array,
+    token_features: jax.Array,
+    prior_bias: jax.Array,
+    previous_hidden: jax.Array,
+    identity: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """One agent's recurrent token-attention step (pass 1, before communication)."""
+    scale = jnp.sqrt(jnp.asarray(shared.shape[-1], jnp.float32))
+    keys = token_features @ params.key_projection
+    base = jnp.tanh(shared + previous_hidden @ params.recurrent_projection + identity)
+    query = base @ params.query_projection
+    attention = jax.nn.softmax((keys @ query) / scale + prior_bias)
+    evidence = attention @ token_features
+    hidden = jnp.tanh(base + evidence @ params.evidence_projection)
+    return attention, hidden
+
+
+def _recompute_trunk(params: SwarmParams, proposals: "ProposalBatch") -> jax.Array:
+    """Differentiable recomputation of the post-communication agent hiddens."""
+    _, hiddens = jax.vmap(
+        lambda previous, identity: _agent_trunk_step(
+            params, proposals.trunk_shared, proposals.trunk_tokens,
+            proposals.trunk_prior, previous, identity,
+        )
+    )(proposals.trunk_previous, params.agent_identity)
+    hiddens = jnp.where(proposals.active_mask[:, None], hiddens, 0.0)
+    return _agent_communicate(hiddens, proposals.active_mask, params)
+
+
 def _propose_kernel(
     params: SwarmParams,
     state: SwarmState,
@@ -481,20 +533,14 @@ def _propose_kernel(
      retrieval_score, action_prior) = _read_macrograph(state.graph, raw_embedding, task_id, config)
     graph_features = jnp.concatenate((graph_embedding, graph_attention, graph_hypotheses))
     shared = jnp.tanh(raw_embedding + graph_features @ params.graph_projection)
-    keys = token_features @ params.key_projection
     prior_bias = jnp.log(graph_attention + 1e-6) * (0.15 * retrieval_score)
     hyp_prior = jnp.log(graph_hypotheses + 1e-6) * (0.15 * retrieval_score)
-    scale = jnp.sqrt(jnp.asarray(h, jnp.float32))
     offsets = jnp.arange(config.chunk_size, dtype=jnp.int32)
 
-    def one_agent(index, previous_hidden, identity, action_bias, role_bias):
-        base = jnp.tanh(shared + previous_hidden @ params.recurrent_projection + identity)
-        query = base @ params.query_projection
-        attention_logits = (keys @ query) / scale + prior_bias
-        attention = jax.nn.softmax(attention_logits)
-        evidence = attention @ token_features
-        hidden = jnp.tanh(base + evidence @ params.evidence_projection)
-        return attention, hidden
+    def one_agent(previous_hidden, identity):
+        return _agent_trunk_step(
+            params, shared, token_features, prior_bias, previous_hidden, identity
+        )
 
     # Pass 1: independent hiddens
     initial_h = jnp.zeros((padded, h), jnp.float32)
@@ -507,11 +553,8 @@ def _propose_kernel(
         indices = start + offsets
         safe = jnp.minimum(indices, padded - 1)
         attn_chunk, hid_chunk = jax.vmap(one_agent)(
-            safe,
             state.agent_hidden[safe],
             params.agent_identity[safe],
-            params.agent_action_bias[safe],
-            params.agent_role_bias[safe],
         )
         active = indices < active_count
         hid_chunk = jnp.where(active[:, None], hid_chunk, 0.0)
@@ -578,6 +621,10 @@ def _propose_kernel(
         state_embedding=raw_embedding,
         retrieval_score=retrieval_score,
         action_prior=action_prior,
+        trunk_shared=shared,
+        trunk_tokens=token_features,
+        trunk_prior=prior_bias,
+        trunk_previous=state.agent_hidden,
     )
 
 
@@ -735,19 +782,19 @@ def _feedback_kernel(
     policy_gradient = advantage * (chosen_one_hot[None, :] - proposals.action_probs)
     bias_update = config.policy_learning_rate * policy_gradient * active[:, None]
 
-    def value_loss(action_projection):
+    def value_loss(action_projection, hidden):
         values = (
-            proposals.agent_hidden @ action_projection
+            hidden @ action_projection
             + params.agent_action_bias
             + proposals.action_prior[None, :]
         )
         errors = values[:, action] - reward
         return 0.5 * jnp.sum(jnp.square(errors) * active) / (jnp.sum(active) + eps)
 
-    value_gradient = jax.grad(value_loss)(params.action_projection)
+    value_gradient = jax.grad(value_loss)(params.action_projection, proposals.agent_hidden)
 
-    def forecast_loss(action_effect, color_projection, change_projection):
-        conditioned = jnp.tanh(proposals.agent_hidden + action_effect[action][None, :])
+    def forecast_loss(action_effect, color_projection, change_projection, hidden):
+        conditioned = jnp.tanh(hidden + action_effect[action][None, :])
         color_logits = (conditioned @ color_projection).reshape(
             (proposals.active_mask.shape[0], config.patch_count, config.num_colors)
         )
@@ -761,7 +808,8 @@ def _feedback_kernel(
         return jnp.sum(per_agent * active) / (jnp.sum(active) + eps)
 
     forecast_grads = jax.grad(forecast_loss, argnums=(0, 1, 2))(
-        params.action_effect, params.color_projection, params.change_projection
+        params.action_effect, params.color_projection, params.change_projection,
+        proposals.agent_hidden,
     )
     forecast_rate = config.prediction_learning_rate * has_next.astype(jnp.float32)
 
@@ -781,15 +829,43 @@ def _feedback_kernel(
     clicked = (action == 5).astype(jnp.float32)
     coord_weight = clicked * jnp.where(has_change, 1.0, jnp.maximum(advantage, 0.0))
 
-    def coordinate_loss(coordinate_projection):
-        predicted = jax.nn.sigmoid(proposals.agent_hidden @ coordinate_projection)
+    def coordinate_loss(coordinate_projection, hidden):
+        predicted = jax.nn.sigmoid(hidden @ coordinate_projection)
         per_agent = jnp.sum(jnp.square(predicted - coord_target[None, :]), axis=-1)
         return 0.5 * jnp.sum(per_agent * active) / (jnp.sum(active) + eps)
 
-    coord_loss, coord_gradient = jax.value_and_grad(coordinate_loss)(params.coordinate_projection)
+    coord_loss, coord_gradient = jax.value_and_grad(coordinate_loss)(
+        params.coordinate_projection, proposals.agent_hidden
+    )
     coord_rate = config.coordinate_learning_rate * coord_weight
 
+    # Trunk learning: backpropagate the same value / forecast / click losses
+    # through recurrence, token query/key attention, and agent communication.
+    forecast_gate = has_next.astype(jnp.float32)
+
+    def trunk_loss(trunk):
+        trunk_params = params._replace(**trunk)
+        hidden = _recompute_trunk(trunk_params, proposals)
+        return (
+            value_loss(params.action_projection, hidden)
+            + forecast_gate * forecast_loss(
+                params.action_effect, params.color_projection, params.change_projection, hidden
+            )
+            + coord_weight * coordinate_loss(params.coordinate_projection, hidden)
+        )
+
+    trunk = {name: getattr(params, name) for name in TRUNK_FIELDS}
+    trunk_value, trunk_grads = jax.value_and_grad(trunk_loss)(trunk)
+    trunk_grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in trunk_grads.values()))
+    trunk_scale = config.trunk_learning_rate * jnp.minimum(
+        1.0, config.trunk_grad_clip_norm / (trunk_grad_norm + 1e-12)
+    )
+    trunk_update = {
+        name: trunk[name] - trunk_scale * trunk_grads[name] for name in TRUNK_FIELDS
+    }
+
     params = params._replace(
+        **trunk_update,
         action_projection=params.action_projection - config.value_learning_rate * value_gradient,
         action_effect=params.action_effect - forecast_rate * forecast_grads[0],
         color_projection=params.color_projection - forecast_rate * forecast_grads[1],
@@ -815,8 +891,10 @@ def _feedback_kernel(
         step_count=state.step_count + 1,
         graph=graph,
     )
-    coord_diagnostics = jnp.stack((coord_loss * (coord_weight > 0), coord_weight))
-    return params, state, prediction_error, surprise, coord_diagnostics
+    diagnostics = jnp.stack((
+        coord_loss * (coord_weight > 0), coord_weight, trunk_value, trunk_grad_norm,
+    ))
+    return params, state, prediction_error, surprise, diagnostics
 
 
 def _legal_action_mask(actions: Any, num_actions: int = 6) -> np.ndarray:
@@ -1046,7 +1124,7 @@ class JAXProposalSwarm:
             next_colors = color_ids.reshape((self.config.patch_count,))
             has_next = jnp.asarray(True)
 
-        new_params, new_state, prediction_error, surprise, coord_diagnostics = self._feedback_jit(
+        new_params, new_state, prediction_error, surprise, diagnostics = self._feedback_jit(
             self.params, self.state, pending,
             jnp.asarray(float(reward), jnp.float32),
             next_colors, has_next,
@@ -1170,8 +1248,10 @@ class JAXProposalSwarm:
             "projection_updated": bool(jax.device_get(projection_updated)),
             "projection_loss": float(jax.device_get(projection_loss)),
             "projection_grad_norm": float(jax.device_get(projection_grad_norm)),
-            "coordinate_loss": float(jax.device_get(coord_diagnostics[0])),
-            "coordinate_update_weight": float(jax.device_get(coord_diagnostics[1])),
+            "coordinate_loss": float(jax.device_get(diagnostics[0])),
+            "coordinate_update_weight": float(jax.device_get(diagnostics[1])),
+            "trunk_loss": float(jax.device_get(diagnostics[2])),
+            "trunk_grad_norm": float(jax.device_get(diagnostics[3])),
         }
 
     def cancel_pending(self) -> None:
