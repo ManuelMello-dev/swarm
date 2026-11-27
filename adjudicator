@@ -7,7 +7,11 @@ adjudication. Pure-JAX memory only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import wraps
+from threading import RLock
+from types import MappingProxyType
+from uuid import uuid4
 from math import ceil
 from typing import Any, Callable, NamedTuple, Optional
 
@@ -16,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax, random
 
-from jax_quantum_memory import JAXQuantumMemoryField
+from jax_quantum_memory import JAXQuantumMemoryField, MemorySnapshot
 from qPSO_and_role_updates import (
     init_qpso, qpso_step, role_rotation_update, QPSOState,
 )
@@ -255,6 +259,7 @@ class Decision:
     predicted_change_map: np.ndarray
     predicted_grid: np.ndarray
     proposals: ProposalBatch
+    proposal_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -952,10 +957,123 @@ def _validated_grid(grid: Any) -> np.ndarray:
     return np.clip(np.rint(arr), 0, 9).astype(np.int32)
 
 
+class Outcome(NamedTuple):
+    """Canonical, immutable outcome identity for process-local deduplication."""
+    reward: float
+    task_id: int
+    grid_shape: Optional[tuple[int, int]]
+    grid_data: Optional[bytes]
+
+    def grid(self):
+        if self.grid_shape is None:
+            return None
+        return np.frombuffer(self.grid_data, dtype="<i4").reshape(self.grid_shape)
+
+
+@dataclass(frozen=True)
+class ExecutionReceipt:
+    status: str
+    raw_outcome: Any = None
+    parser: Optional[Callable] = None
+    outcome: Optional[Outcome] = None
+
+
+@dataclass(frozen=True)
+class CompletedFeedback:
+    outcome: Outcome
+    result_items: tuple
+
+
+@dataclass(frozen=True)
+class RuntimeBundle:
+    """One publication boundary for learning state and feedback identity."""
+    params: SwarmParams
+    state: SwarmState
+    memory: MemorySnapshot
+    qpso: QPSOState
+    role_fitness: jax.Array
+    prev_role_fitness: jax.Array
+    _qpso_key: jax.Array
+    _qpso_steps: int
+    _surprise_mean: float
+    _surprise_var: float
+    _surprise_count: int
+    _pending: Optional[PendingRound]
+    _pre_proposal_state: Optional[SwarmState]
+    _pending_memory_amplitudes: Optional[jax.Array]
+    _pending_memory_features: Optional[jax.Array]
+    last_memory_features: jax.Array
+    last_decision: Optional[Decision]
+    _pending_proposal_id: Optional[str]
+    _execution: Optional[ExecutionReceipt]
+    _completed: Any
+
+
+@dataclass(frozen=True)
+class FeedbackCandidate:
+    runtime: RuntimeBundle
+    prediction_error: jax.Array
+    surprise: jax.Array
+    projection_loss: jax.Array
+    projection_grad_norm: jax.Array
+    projection_updated: jax.Array
+    diagnostics: jax.Array
+
+
+class _RuntimeField:
+    """Keep existing parameter/state attributes backed by a single bundle."""
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        with instance._feedback_lock:
+            if "_runtime" not in instance.__dict__:
+                return instance.__dict__[self.name]
+            return getattr(instance._runtime, self.name)
+
+    def __set__(self, instance, value):
+        with instance._feedback_lock:
+            if "_runtime" not in instance.__dict__:
+                instance.__dict__[self.name] = value
+            else:
+                instance._runtime = replace(instance._runtime, **{self.name: value})
+
+
+def _serialized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._feedback_lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class JAXProposalSwarm:
     """Stateful host wrapper with agent interaction."""
 
+    params = _RuntimeField()
+    state = _RuntimeField()
+    qpso = _RuntimeField()
+    role_fitness = _RuntimeField()
+    prev_role_fitness = _RuntimeField()
+    _qpso_key = _RuntimeField()
+    _qpso_steps = _RuntimeField()
+    _surprise_mean = _RuntimeField()
+    _surprise_var = _RuntimeField()
+    _surprise_count = _RuntimeField()
+    _pending = _RuntimeField()
+    _pre_proposal_state = _RuntimeField()
+    _pending_memory_amplitudes = _RuntimeField()
+    _pending_memory_features = _RuntimeField()
+    last_memory_features = _RuntimeField()
+    last_decision = _RuntimeField()
+    _pending_proposal_id = _RuntimeField()
+    _execution = _RuntimeField()
+    _completed = _RuntimeField()
+
     def __init__(self, config: SwarmConfig = SwarmConfig()) -> None:
+        self._feedback_lock = RLock()
         self.config = config
         self.hardware_agent_cap = _agent_cap_for_budget(config)
         if self.hardware_agent_cap < config.min_agents:
@@ -1019,13 +1137,36 @@ class JAXProposalSwarm:
                 _feedback_kernel(params, state, pending, reward, colors, has_next, config)
         )
 
+        self._pending_proposal_id = None
+        self._execution = None
+        self._completed = MappingProxyType({})
+        initial = {name: self.__dict__.pop(name) for name in (
+            'params', 'state', 'qpso', 'role_fitness', 'prev_role_fitness', '_qpso_key', '_qpso_steps', '_surprise_mean', '_surprise_var', '_surprise_count', '_pending', '_pre_proposal_state', '_pending_memory_amplitudes', '_pending_memory_features', 'last_memory_features', 'last_decision', '_pending_proposal_id', '_execution', '_completed')}
+        self._runtime = RuntimeBundle(memory=self.quantum_memory.snapshot, **initial)
+        self.quantum_memory.bind_snapshot(
+            lambda: self._runtime.memory, self._set_memory_snapshot, self._feedback_lock,
+        )
+
+    def _set_memory_snapshot(self, snapshot):
+        self._runtime = replace(self._runtime, memory=snapshot)
+
+    @_serialized
     def choose_active_agents(self, novelty, uncertainty, disagreement, legal_action_count):
         return choose_active_count(
             novelty, uncertainty, disagreement, legal_action_count,
             self.config.min_agents, self.hardware_agent_cap, self.config.num_actions,
         )
 
+    @_serialized
     def propose(self, grid, legal_actions, task_id, novelty=0.0, uncertainty=0.0) -> Decision:
+        before = self._runtime
+        try:
+            return self._propose(grid, legal_actions, task_id, novelty, uncertainty)
+        except Exception:
+            self._runtime = before
+            raise
+
+    def _propose(self, grid, legal_actions, task_id, novelty=0.0, uncertainty=0.0) -> Decision:
         if self._pending is not None:
             raise RuntimeError("observe_outcome or cancel_pending is required before another proposal")
         grid_np = _validated_grid(grid)
@@ -1037,6 +1178,8 @@ class JAXProposalSwarm:
             novelty, uncertainty, float(jax.device_get(self.state.last_disagreement)), int(legal_np.sum())
         )
         self._pre_proposal_state = self.state
+        self._pending_proposal_id = uuid4().hex
+        self._execution = None
         grid_jax = jnp.asarray(grid_np, dtype=jnp.int32)
         legal_jax = jnp.asarray(legal_np, dtype=jnp.bool_)
         phase = self.state.step_count.astype(jnp.float32)
@@ -1117,97 +1260,148 @@ class JAXProposalSwarm:
             predicted_change_map=change_map,
             predicted_grid=predicted_grid,
             proposals=proposals,
+            proposal_id=self._pending_proposal_id,
         )
         self.last_decision = decision
         return decision
 
-    def observe_outcome(self, reward: float, next_grid=None, task_id=None) -> dict:
-        if self._pending is None:
-            raise RuntimeError("there is no pending decision to learn from")
-        pending = self._pending
-        if task_id is not None and int(task_id) != int(jax.device_get(pending.task_id)):
-            raise ValueError("outcome task_id does not match the pending decision")
-        if not np.isfinite(float(reward)):
+    @staticmethod
+    def _canonical_outcome(reward, next_grid, task_id) -> Outcome:
+        reward = float(reward)
+        if not np.isfinite(reward):
             raise ValueError("reward must be finite")
-
         if next_grid is None:
+            return Outcome(reward, int(task_id), None, None)
+        grid = np.asarray(_validated_grid(next_grid), dtype="<i4")
+        return Outcome(reward, int(task_id), grid.shape, grid.tobytes())
+
+    @_serialized
+    def observe_outcome(self, reward: float, next_grid=None, task_id=None, *, proposal_id=None) -> dict:
+        """Learn atomically; an explicit proposal ID makes delivery idempotent.
+
+        A failed computation keeps the proposal pending and all learning state
+        unchanged. Completion records are process-local, not durable checkpoints.
+        """
+        current = self._runtime
+        if proposal_id is not None and proposal_id in current._completed:
+            completed = current._completed[proposal_id]
+            effective_task = completed.outcome.task_id if task_id is None else task_id
+            outcome = self._canonical_outcome(reward, next_grid, effective_task)
+            if outcome != completed.outcome:
+                raise ValueError("conflicting outcome for completed proposal")
+            return dict(completed.result_items)
+        if proposal_id is not None and proposal_id != current._pending_proposal_id:
+            raise ValueError("unknown, cancelled, or mismatched proposal_id")
+        if current._pending is None:
+            raise RuntimeError("there is no pending decision to learn from")
+        if current._execution is not None and current._execution.status == "executing":
+            raise RuntimeError("cannot learn while external action execution is in progress")
+        pending_task = int(jax.device_get(current._pending.task_id))
+        if task_id is not None and int(task_id) != pending_task:
+            raise ValueError("outcome task_id does not match the pending decision")
+        outcome = self._canonical_outcome(reward, next_grid, pending_task)
+        receipt = current._execution
+        if receipt is not None and receipt.outcome is not None and outcome != receipt.outcome:
+            raise ValueError("outcome conflicts with the retained execution receipt")
+        candidate = self._compute_feedback_candidate(current, outcome)
+        self._synchronize_feedback(candidate)
+        result = self._feedback_result(candidate)
+        # Allocate/cache everything that can raise before the sole publication.
+        completed = dict(current._completed)
+        completed[current._pending_proposal_id] = CompletedFeedback(outcome, tuple(result.items()))
+        committed = replace(
+            candidate.runtime, _completed=MappingProxyType(completed),
+            _pending=None, _pre_proposal_state=None, _pending_memory_amplitudes=None,
+            _pending_memory_features=None, _pending_proposal_id=None, _execution=None,
+        )
+        self._runtime = committed
+        return result
+
+    def _compute_feedback_candidate(self, current: RuntimeBundle, outcome: Outcome) -> FeedbackCandidate:
+        pending = current._pending
+        params, state, qpso = current.params, current.state, current.qpso
+        role_fitness, prev_role_fitness = current.role_fitness, current.prev_role_fitness
+        _qpso_key, _qpso_steps = current._qpso_key, current._qpso_steps
+        grid = outcome.grid()
+        if grid is None:
             next_colors = jnp.full((self.config.patch_count,), -1, jnp.int32)
             has_next = jnp.asarray(False)
         else:
-            _, color_ids = _grid_tokens(jnp.asarray(_validated_grid(next_grid)), self.config)
+            _, color_ids = _grid_tokens(jnp.asarray(grid), self.config)
             next_colors = color_ids.reshape((self.config.patch_count,))
             has_next = jnp.asarray(True)
-
         new_params, new_state, prediction_error, surprise, diagnostics = self._feedback_jit(
-            self.params, self.state, pending,
-            jnp.asarray(float(reward), jnp.float32),
+            params, state, pending,
+            jnp.asarray(outcome.reward, jnp.float32),
             next_colors, has_next,
         )
 
         # Quantum memory encode with surprise-modulated weight
-        memory_amplitudes = self._pending_memory_amplitudes
+        memory_amplitudes = current._pending_memory_amplitudes
         decision = pending.adjudication
         surprise_value = float(jax.device_get(surprise))
-        emotional = self._emotional_weight(surprise_value)
+        emotional, surprise_mean, surprise_var, surprise_count = self._candidate_emotional_weight(
+            current, surprise_value
+        )
         memory_state_after = self.quantum_memory.candidate_encode(
             memory_amplitudes,
             int(jax.device_get(decision.action_index)) + 1,
-            float(reward),
+            outcome.reward,
             int(jax.device_get(pending.task_id)),
-            float(jax.device_get(self.state.step_count)),
+            float(jax.device_get(state.step_count)),
             emotional,
-            features=self._pending_memory_features,
+            features=current._pending_memory_features, snapshot=current.memory,
         )
         # EMA in effect when this decision was evaluated; QPSO fits the residual on top of it.
-        pre_feedback_baseline = self.state.reward_baseline
-        self.params, self.state = new_params, new_state
-        self.quantum_memory.state = memory_state_after
+        pre_feedback_baseline = state.reward_baseline
+        params, state = new_params, new_state
+        memory = MemorySnapshot(memory_state_after, current.memory.proj_real, current.memory.proj_imag)
 
         # Role fitness + rotation + QPSO (same as before)
-        self._qpso_steps += 1
+        _qpso_steps += 1
         projection_loss = jnp.asarray(0.0, jnp.float32)
         projection_grad_norm = jnp.asarray(0.0, jnp.float32)
         projection_updated = jnp.asarray(False)
-        if self._qpso_steps % self.config.quantum_projection_update_every == 0:
-            projection_loss, projection_grad_norm, projection_updated = (
-                self.quantum_memory.update_projection(
-                    self._pending_memory_features,
+        if _qpso_steps % self.config.quantum_projection_update_every == 0:
+            memory, projection_loss, projection_grad_norm, projection_updated = (
+                self.quantum_memory.candidate_projection(
+                    memory, current._pending_memory_features,
                     int(jax.device_get(pending.task_id)),
                     self.config.quantum_projection_learning_rate,
                 )
             )
         surprise_f = float(jax.device_get(surprise))
-        reward_f = float(reward)
+        reward_f = outcome.reward
         active = np.asarray(jax.device_get(pending.proposals.active_mask))
         conf = np.asarray(jax.device_get(pending.proposals.confidence))
         role_ids = np.arange(self.padded_agent_count) % self.num_roles
         for r in range(self.num_roles):
             mask = (role_ids == r) & active
             if mask.any():
-                self.role_fitness = self.role_fitness.at[r].set(
-                    0.9 * self.role_fitness[r] + 0.1 * (conf[mask].mean() + 0.5 * reward_f)
+                role_fitness = role_fitness.at[r].set(
+                    0.9 * role_fitness[r] + 0.1 * (conf[mask].mean() + 0.5 * reward_f)
                 )
 
-        if self._qpso_steps % self.rotation_every == 0:
-            role_bias_table = self.params.agent_role_bias[: self.num_roles]
+        if _qpso_steps % self.rotation_every == 0:
+            role_bias_table = params.agent_role_bias[: self.num_roles]
             updated_table = role_rotation_update(
-                role_bias_table, self.role_fitness, self.prev_role_fitness,
+                role_bias_table, role_fitness, prev_role_fitness,
                 theta_max=self.rotation_theta_max,
             )
             new_role_bias = updated_table[role_ids]
-            self.params = self.params._replace(agent_role_bias=new_role_bias)
-            self.prev_role_fitness = self.role_fitness
+            params = params._replace(agent_role_bias=new_role_bias)
+            prev_role_fitness = role_fitness
 
-        if self._qpso_steps % self.qpso_every == 0:
-            self._qpso_key, subkey = random.split(self._qpso_key)
-            role_bias_table = self.params.agent_role_bias[: self.num_roles]
+        if _qpso_steps % self.qpso_every == 0:
+            _qpso_key, subkey = random.split(_qpso_key)
+            role_bias_table = params.agent_role_bias[: self.num_roles]
             current_vec = jnp.concatenate([
                 role_bias_table.reshape(-1),
-                self.params.baseline_weights,
-                self.params.baseline_bias[None],
+                params.baseline_weights,
+                params.baseline_bias[None],
             ])
-            pos = self.qpso.particles.position.at[0].set(current_vec)
-            self.qpso = self.qpso._replace(particles=self.qpso.particles._replace(position=pos))
+            pos = qpso.particles.position.at[0].set(current_vec)
+            qpso = qpso._replace(particles=qpso.particles._replace(position=pos))
 
             emb = pending.state_embedding
             chosen_hyp = int(jax.device_get(jnp.argmax(pending.adjudication.hypothesis_probs)))
@@ -1226,87 +1420,120 @@ class JAXProposalSwarm:
                 alignment = alignment / max(1, self.num_roles)
                 return baseline_term + 0.5 * alignment + (reward_f - 0.5 * surprise_f)
 
-            fitness = jax.vmap(_particle_fitness)(self.qpso.particles.position)
-            pbest_fitness = jax.vmap(_particle_fitness)(self.qpso.particles.personal_best)
-            gbest_fitness = _particle_fitness(self.qpso.global_best)
-            self.qpso = qpso_step(
-                self.qpso, fitness, subkey,
+            fitness = jax.vmap(_particle_fitness)(qpso.particles.position)
+            pbest_fitness = jax.vmap(_particle_fitness)(qpso.particles.personal_best)
+            gbest_fitness = _particle_fitness(qpso.global_best)
+            qpso = qpso_step(
+                qpso, fitness, subkey,
                 personal_best_fitness=pbest_fitness,
                 global_best_fitness=gbest_fitness,
             )
 
-            gbest = self.qpso.global_best
+            gbest = qpso.global_best
             rb_dim = self.num_roles * self.config.num_hypotheses
             new_role_table = gbest[:rb_dim].reshape(self.num_roles, self.config.num_hypotheses)
             new_baseline_w = gbest[rb_dim:rb_dim + self.config.hidden_dim]
             new_baseline_b = gbest[-1]
             new_role_bias = new_role_table[role_ids]
-            self.params = self.params._replace(
+            params = params._replace(
                 agent_role_bias=new_role_bias,
                 baseline_weights=new_baseline_w,
                 baseline_bias=new_baseline_b,
             )
 
-        self._pending = None
-        self._pre_proposal_state = None
-        self._pending_memory_amplitudes = None
-        self._pending_memory_features = None
+        runtime = replace(
+            current, params=params, state=state, memory=memory, qpso=qpso,
+            role_fitness=role_fitness, prev_role_fitness=prev_role_fitness,
+            _qpso_key=_qpso_key, _qpso_steps=_qpso_steps,
+            _surprise_mean=surprise_mean, _surprise_var=surprise_var,
+            _surprise_count=surprise_count,
+        )
+        return FeedbackCandidate(runtime, prediction_error, surprise, projection_loss,
+                                 projection_grad_norm, projection_updated, diagnostics)
+
+    def _synchronize_feedback(self, candidate: FeedbackCandidate) -> None:
+        runtime = candidate.runtime
+        arrays = (
+            runtime.params, runtime.state, runtime.memory,
+            runtime.qpso.particles.position, runtime.qpso.particles.personal_best,
+            runtime.qpso.global_best, runtime.qpso.beta, runtime.qpso.generation,
+            runtime.role_fitness, runtime.prev_role_fitness, runtime._qpso_key,
+            candidate.prediction_error, candidate.surprise, candidate.projection_loss,
+            candidate.projection_grad_norm, candidate.projection_updated, candidate.diagnostics,
+        )
+        jax.block_until_ready(arrays)
+        checks = [jnp.all(jnp.isfinite(value)) for value in jax.tree_util.tree_leaves(arrays)
+                  if jnp.issubdtype(value.dtype, jnp.inexact)]
+        # QPSO legitimately uses -inf fitness until its first generation.
+        fitness = (runtime.qpso.particles.personal_best_fitness, runtime.qpso.global_best_fitness)
+        unscored = int(jax.device_get(runtime.qpso.generation)) == 0
+        checks.extend(jnp.all(jnp.isfinite(value) | (jnp.isneginf(value) & unscored))
+                      for value in fitness)
+        jax.block_until_ready(checks)
+        if not all(bool(jax.device_get(check)) for check in checks) or not np.all(np.isfinite([
+            runtime._surprise_mean, runtime._surprise_var,
+        ])):
+            raise FloatingPointError("nonfinite feedback candidate; nothing committed")
+
+    def _feedback_result(self, candidate: FeedbackCandidate) -> dict:
+        runtime = candidate.runtime
         return {
-            "step": int(jax.device_get(self.state.step_count)),
-            "graph_nodes": int(jax.device_get(self.state.graph.count)),
-            "mean_reliability": float(jax.device_get(jnp.mean(self.state.reliability))),
-            "prediction_cross_entropy": float(jax.device_get(prediction_error)),
-            "reward_baseline": float(jax.device_get(self.state.reward_baseline)),
-            "surprise": float(jax.device_get(surprise)),
-            "qpso_generation": int(jax.device_get(self.qpso.generation)),
-            "qpso_best_fitness": float(jax.device_get(self.qpso.global_best_fitness)),
-            "projection_updated": bool(jax.device_get(projection_updated)),
-            "projection_loss": float(jax.device_get(projection_loss)),
-            "projection_grad_norm": float(jax.device_get(projection_grad_norm)),
-            "coordinate_loss": float(jax.device_get(diagnostics[0])),
-            "coordinate_update_weight": float(jax.device_get(diagnostics[1])),
-            "trunk_loss": float(jax.device_get(diagnostics[2])),
-            "trunk_grad_norm": float(jax.device_get(diagnostics[3])),
+            "step": int(jax.device_get(runtime.state.step_count)),
+            "graph_nodes": int(jax.device_get(runtime.state.graph.count)),
+            "mean_reliability": float(jax.device_get(jnp.mean(runtime.state.reliability))),
+            "prediction_cross_entropy": float(jax.device_get(candidate.prediction_error)),
+            "reward_baseline": float(jax.device_get(runtime.state.reward_baseline)),
+            "surprise": float(jax.device_get(candidate.surprise)),
+            "qpso_generation": int(jax.device_get(runtime.qpso.generation)),
+            "qpso_best_fitness": float(jax.device_get(runtime.qpso.global_best_fitness)),
+            "projection_updated": bool(jax.device_get(candidate.projection_updated)),
+            "projection_loss": float(jax.device_get(candidate.projection_loss)),
+            "projection_grad_norm": float(jax.device_get(candidate.projection_grad_norm)),
+            "coordinate_loss": float(jax.device_get(candidate.diagnostics[0])),
+            "coordinate_update_weight": float(jax.device_get(candidate.diagnostics[1])),
+            "trunk_loss": float(jax.device_get(candidate.diagnostics[2])),
+            "trunk_grad_norm": float(jax.device_get(candidate.diagnostics[3])),
         }
 
-    def _emotional_weight(self, surprise_value: float) -> float:
-        """Map surprise to an emotional weight in [emotional_floor, 1].
-
-        Relative mode scores surprise against the running mean/std of recent
-        surprise (sigmoid of the z-score), so a memory is weighted for being
-        more surprising than usual rather than for being stored early in learning.
-        """
+    def _candidate_emotional_weight(self, current, surprise_value):
         cfg = self.config
+        mean, var, count = current._surprise_mean, current._surprise_var, current._surprise_count
         if not cfg.relative_emotional_weight:
-            return float(np.clip(0.15 + 0.85 * surprise_value, 0.0, 1.0))
-        if self._surprise_count == 0:
-            z = 0.0
-        else:
-            z = (surprise_value - self._surprise_mean) / (np.sqrt(self._surprise_var) + 1e-3)
+            return float(np.clip(0.15 + 0.85 * surprise_value, 0.0, 1.0)), mean, var, count
+        z = 0.0 if count == 0 else (surprise_value - mean) / (np.sqrt(var) + 1e-3)
         relative = 1.0 / (1.0 + np.exp(-np.clip(z, -8.0, 8.0)))
-        decay = cfg.surprise_ema_decay
-        delta = surprise_value - self._surprise_mean
-        if self._surprise_count == 0:
-            self._surprise_mean, self._surprise_var = surprise_value, 0.0
+        decay, delta = cfg.surprise_ema_decay, surprise_value - mean
+        if count == 0:
+            mean, var = surprise_value, 0.0
         else:
-            self._surprise_mean += (1.0 - decay) * delta
-            self._surprise_var = decay * (self._surprise_var + (1.0 - decay) * delta * delta)
-        self._surprise_count += 1
-        return float(np.clip(cfg.emotional_floor + (1.0 - cfg.emotional_floor) * relative, 0.0, 1.0))
+            mean += (1.0 - decay) * delta
+            var = decay * (var + (1.0 - decay) * delta * delta)
+        emotional = float(np.clip(cfg.emotional_floor + (1.0 - cfg.emotional_floor) * relative, 0.0, 1.0))
+        return emotional, mean, var, count + 1
 
+    @_serialized
+    def _emotional_weight(self, surprise_value: float) -> float:
+        """Explicit standalone update; feedback uses the nonmutating candidate form."""
+        emotional, mean, var, count = self._candidate_emotional_weight(self._runtime, surprise_value)
+        self._runtime = replace(self._runtime, _surprise_mean=mean,
+                                _surprise_var=var, _surprise_count=count)
+        return emotional
 
-    def cancel_pending(self) -> None:
+    @_serialized
+    def cancel_pending(self, *, abandon_executed: bool = False) -> None:
         if self._pending is None:
             return
-        if self._pre_proposal_state is not None:
-            self.state = self._pre_proposal_state
-        self._pending = None
-        self._pre_proposal_state = None
-        self._pending_memory_amplitudes = None
-        self._pending_memory_features = None
-        self.last_decision = None
+        if self._execution is not None:
+            if self._execution.status == "executing" or not abandon_executed:
+                raise RuntimeError("action may have executed; reconcile its outcome or explicitly abandon it")
+        self._runtime = replace(
+            self._runtime, state=self._pre_proposal_state or self.state,
+            _pending=None, _pre_proposal_state=None, _pending_memory_amplitudes=None,
+            _pending_memory_features=None, _pending_proposal_id=None,
+            _execution=None, last_decision=None,
+        )
 
-
+    @_serialized
     def reset_episode(self, preserve_graph: bool = True, preserve_reliability: bool = True) -> None:
         if self._pending is not None:
             raise RuntimeError("resolve or cancel the pending action before resetting")
@@ -1321,21 +1548,54 @@ class JAXProposalSwarm:
         )
         self.last_decision = None
 
+    def _parse_receipt(self, receipt, task_id, parser=None):
+        parser = receipt.parser if parser is None else parser
+        if parser is None:
+            raise RuntimeError("a parser is required for the retained receipt")
+        parsed = parser(receipt.raw_outcome)
+        if isinstance(parsed, ExecutionResult):
+            reward, next_grid = parsed.reward, parsed.next_grid
+        else:
+            reward, next_grid = parsed
+        return replace(receipt, parser=parser,
+                       outcome=self._canonical_outcome(reward, next_grid, task_id))
+
+    @_serialized
     def step(self, grid, legal_actions, task_id, execute_action, parse_outcome,
              novelty=0.0, uncertainty=0.0):
         decision = self.propose(grid, legal_actions, task_id, novelty, uncertainty)
+        self._execution = ExecutionReceipt("executing", parser=parse_outcome)
         try:
             raw_outcome = execute_action(decision.action_id, decision.coordinates)
-            parsed = parse_outcome(raw_outcome)
-            if isinstance(parsed, ExecutionResult):
-                reward, next_grid = parsed.reward, parsed.next_grid
-            else:
-                reward, next_grid = parsed
-            feedback = self.observe_outcome(reward, next_grid, task_id=task_id)
-            return decision, raw_outcome, feedback
-        except Exception:
-            self.cancel_pending()
+        except BaseException:
+            # An exception is not proof that the external action did not happen.
+            self._execution = replace(self._execution, status="uncertain")
             raise
+        self._execution = ExecutionReceipt("executed", raw_outcome, parse_outcome)
+        return self.retry_feedback()
+
+    @_serialized
+    def retry_feedback(self, parse_outcome=None):
+        """Retry parsing/learning from a receipt; never execute the action again."""
+        receipt = self._execution
+        if self._pending is None or receipt is None:
+            raise RuntimeError("there is no retained execution receipt")
+        if receipt.status != "executed":
+            raise RuntimeError("execution outcome is uncertain; reconcile with observe_outcome")
+        decision = self.last_decision
+        if receipt.outcome is None:
+            # Preserve the raw receipt on parsing failure, and freeze its parsed
+            # outcome on success so later retries cannot silently change it.
+            receipt = self._parse_receipt(receipt, int(jax.device_get(self._pending.task_id)), parse_outcome)
+            self._execution = receipt
+        elif parse_outcome is not None:
+            parsed = self._parse_receipt(receipt, receipt.outcome.task_id, parse_outcome)
+            if parsed.outcome != receipt.outcome:
+                raise ValueError("replacement parser conflicts with retained outcome")
+        outcome = receipt.outcome
+        result = self.observe_outcome(outcome.reward, outcome.grid(), outcome.task_id,
+                                      proposal_id=decision.proposal_id)
+        return decision, receipt.raw_outcome, result
 
 
 def main() -> None:

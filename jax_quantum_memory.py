@@ -8,7 +8,9 @@ This revision makes the feature→amplitude projection learnable.
 """
 from __future__ import annotations
 
-from typing import NamedTuple, Optional
+import math
+from threading import RLock
+from typing import Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +31,14 @@ class JAXMemoryState(NamedTuple):
     total_recalled: jax.Array   # int32 scalar
     features: jax.Array        # float32 [capacity, FEATURE_DIM]
     feature_valid: jax.Array   # bool [capacity]
+
+
+class MemorySnapshot(NamedTuple):
+    """An immutable, coherent memory state and its projection matrices."""
+
+    state: JAXMemoryState
+    proj_real: jax.Array
+    proj_imag: jax.Array
 
 
 # Feature dimension produced by the hand-crafted extractor
@@ -330,7 +340,8 @@ def _projection_train_step(
 class JAXQuantumMemoryField:
     """Mutable host owner for a JAX-resident fixed-capacity memory state.
 
-    Now also owns the learnable feature→amplitude projection.
+    Owns an immutable state/projection snapshot, or delegates it to a runtime
+    owner under the same reentrant lock. Candidates never publish mutations.
     """
 
     def __init__(
@@ -362,11 +373,14 @@ class JAXQuantumMemoryField:
         self.projection_similarity_temperature = float(projection_similarity_temperature)
         self.projection_reward_temperature = float(projection_reward_temperature)
         self.projection_grad_clip_norm = float(projection_grad_clip_norm)
-        self.state = create_memory_state(capacity, dim)
-
-        # Learnable projection
+        self._lock = RLock()
+        self._get_snapshot: Optional[Callable[[], MemorySnapshot]] = None
+        self._set_snapshot: Optional[Callable[[MemorySnapshot], None]] = None
         key = random.PRNGKey(seed)
-        self.proj_real, self.proj_imag = init_projection(dim, key)
+        proj_real, proj_imag = init_projection(dim, key)
+        self._snapshot = MemorySnapshot(
+            create_memory_state(capacity, dim), proj_real, proj_imag
+        )
 
         self._recall = jax.jit(
             lambda st, q, phase, task: jax_memory_recall(
@@ -385,31 +399,111 @@ class JAXQuantumMemoryField:
             )
         )
 
+    def bind_snapshot(
+        self,
+        get_snapshot: Callable[[], MemorySnapshot],
+        set_snapshot: Callable[[MemorySnapshot], None],
+        lock,
+    ) -> None:
+        """Delegate snapshot access to an owner protected by its shared RLock.
+
+        The owner supplies the initial snapshot. Callbacks must resolve the
+        current runtime rather than capture a particular runtime bundle.
+        """
+        with self._lock:
+            with lock:
+                self._get_snapshot = get_snapshot
+                self._set_snapshot = set_snapshot
+                self._lock = lock
+
+    @property
+    def snapshot(self) -> MemorySnapshot:
+        with self._lock:
+            if self._get_snapshot is not None:
+                return self._get_snapshot()
+            return self._snapshot
+
+    @snapshot.setter
+    def snapshot(self, value: MemorySnapshot) -> None:
+        with self._lock:
+            if self._set_snapshot is not None:
+                self._set_snapshot(value)
+            else:
+                self._snapshot = value
+
+    @property
+    def state(self) -> JAXMemoryState:
+        return self.snapshot.state
+
+    @state.setter
+    def state(self, value: JAXMemoryState) -> None:
+        with self._lock:
+            self.snapshot = self.snapshot._replace(state=value)
+
+    @property
+    def proj_real(self) -> jax.Array:
+        return self.snapshot.proj_real
+
+    @proj_real.setter
+    def proj_real(self, value: jax.Array) -> None:
+        with self._lock:
+            self.snapshot = self.snapshot._replace(proj_real=value)
+
+    @property
+    def proj_imag(self) -> jax.Array:
+        return self.snapshot.proj_imag
+
+    @proj_imag.setter
+    def proj_imag(self, value: jax.Array) -> None:
+        with self._lock:
+            self.snapshot = self.snapshot._replace(proj_imag=value)
+
     def encode_grid(self, grid: jax.Array) -> jax.Array:
         """Convenience: grid → amplitudes using current learnable projection."""
         return self.encode_grid_with_features(grid)[1]
 
     def encode_grid_with_features(self, grid: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return both the raw feature vector and its current amplitude embedding."""
-        features = extract_grid_features(grid)
-        return features, project_features(features, self.proj_real, self.proj_imag)
+        with self._lock:
+            snapshot = self.snapshot
+            features = extract_grid_features(grid)
+            return features, project_features(features, snapshot.proj_real, snapshot.proj_imag)
 
-    def update_projection(
-        self, query_features: jax.Array, task_id: int, learning_rate: float
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Update both projection matrices and re-embed feature-bearing memories."""
-        if learning_rate <= 0:
-            raise ValueError("learning_rate must be positive")
-        (
-            self.proj_real, self.proj_imag, self.state,
-            loss, grad_norm, updated,
-        ) = self._projection_train(
-            self.proj_real, self.proj_imag, self.state,
+    def candidate_projection(
+        self,
+        snapshot: MemorySnapshot,
+        query_features: jax.Array,
+        task_id: int,
+        learning_rate: float,
+    ) -> tuple[MemorySnapshot, jax.Array, jax.Array, jax.Array]:
+        """Stage projection training and re-embedding from explicit inputs only."""
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("learning_rate must be positive and finite")
+        real, imag, state, loss, grad_norm, updated = self._projection_train(
+            snapshot.proj_real, snapshot.proj_imag, snapshot.state,
             jnp.asarray(query_features, jnp.float32),
             jnp.asarray(task_id, jnp.int32),
             jnp.asarray(learning_rate, jnp.float32),
         )
-        return loss, grad_norm, updated
+        return MemorySnapshot(state, real, imag), loss, grad_norm, updated
+
+    def update_projection(
+        self, query_features: jax.Array, task_id: int, learning_rate: float
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Synchronize and validate an update before publishing one snapshot."""
+        with self._lock:
+            candidate, loss, grad_norm, updated = self.candidate_projection(
+                self.snapshot, query_features, task_id, learning_rate
+            )
+            result = (candidate, loss, grad_norm, updated)
+            jax.block_until_ready(result)
+            for value in jax.tree_util.tree_leaves(result):
+                if jnp.issubdtype(value.dtype, jnp.inexact):
+                    if not bool(jax.device_get(jnp.all(jnp.isfinite(value)))):
+                        raise FloatingPointError("projection candidate contains non-finite values")
+            diagnostics = (loss, grad_norm, updated)
+            self.snapshot = candidate
+            return diagnostics
 
     def recall(
         self,
@@ -417,11 +511,16 @@ class JAXQuantumMemoryField:
         phase: float | jax.Array,
         task_id: int | jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        self.state = self.state._replace(
-            total_recalled=self.state.total_recalled
-            + (self.state.count > 0).astype(jnp.int32)
-        )
-        return self._recall(self.state, query, phase, task_id)
+        with self._lock:
+            snapshot = self.snapshot
+            state = snapshot.state
+            state = state._replace(
+                total_recalled=state.total_recalled
+                + (state.count > 0).astype(jnp.int32)
+            )
+            result = self._recall(state, query, phase, task_id)
+            self.snapshot = snapshot._replace(state=state)
+            return result
 
     def encode(
         self,
@@ -433,9 +532,13 @@ class JAXQuantumMemoryField:
         emotional_weight: float = 1.0,
         features: Optional[jax.Array] = None,
     ) -> None:
-        self.state = self.candidate_encode(
-            amplitudes, action_id, reward, task_id, phase, emotional_weight, features
-        )
+        with self._lock:
+            snapshot = self.snapshot
+            state = self.candidate_encode(
+                amplitudes, action_id, reward, task_id, phase, emotional_weight,
+                features, snapshot=snapshot,
+            )
+            self.snapshot = snapshot._replace(state=state)
 
     def candidate_encode(
         self,
@@ -446,17 +549,24 @@ class JAXQuantumMemoryField:
         phase: float,
         emotional_weight: float = 1.0,
         features: Optional[jax.Array] = None,
+        *,
+        snapshot: Optional[MemorySnapshot] = None,
     ) -> JAXMemoryState:
+        """Stage an insertion using a supplied or coherently captured snapshot."""
+        if snapshot is None:
+            snapshot = self.snapshot
         return self._encode(
-            self.state, amplitudes, action_id, reward, task_id, phase, emotional_weight,
+            snapshot.state, amplitudes, action_id, reward, task_id, phase, emotional_weight,
             features,
         )
 
     def get_stats(self) -> dict[str, int | float | bool]:
-        return {
-            "total_memories": int(jax.device_get(self.state.count)),
-            "total_encoded": int(jax.device_get(self.state.total_encoded)),
-            "total_recalled": int(jax.device_get(self.state.total_recalled)),
-            "capacity": self.capacity,
-            "dim": self.dim,
-        }
+        with self._lock:
+            state = self.snapshot.state
+            return {
+                "total_memories": int(jax.device_get(state.count)),
+                "total_encoded": int(jax.device_get(state.total_encoded)),
+                "total_recalled": int(jax.device_get(state.total_recalled)),
+                "capacity": self.capacity,
+                "dim": self.dim,
+            }
