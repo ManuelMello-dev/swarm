@@ -45,6 +45,7 @@ class SwarmConfig:
     num_colors: int = 10
     graph_capacity: int = 128
     retrieval_top_k: int = 8
+    graph_action_prior_weight: float = 0.5
     memory_budget_mb: float = 256.0
     cross_task_weight: float = 0.25
     use_phi_drift: bool = True
@@ -97,7 +98,8 @@ class SwarmConfig:
         if self.quantum_projection_learning_rate <= 0:
             raise ValueError("quantum_projection_learning_rate must be positive")
         for name in (
-            "cross_task_weight", "policy_learning_rate", "reliability_learning_rate",
+            "cross_task_weight", "graph_action_prior_weight",
+            "policy_learning_rate", "reliability_learning_rate",
             "value_learning_rate", "prediction_learning_rate", "baseline_decay",
             "quantum_projection_learning_rate", "qpso_beta", "qpso_init_scale",
             "rotation_theta_max",
@@ -188,6 +190,7 @@ class ProposalBatch(NamedTuple):
     current_colors: jax.Array
     state_embedding: jax.Array
     retrieval_score: jax.Array
+    action_prior: jax.Array
 
 
 class Adjudication(NamedTuple):
@@ -414,7 +417,20 @@ def _read_macrograph(graph, query, task_id, config):
         hypothesis_context / (jnp.sum(hypothesis_context) + eps),
         jnp.full((config.num_hypotheses,), 1.0 / config.num_hypotheses, jnp.float32),
     )
-    return embedding_context, attention_context, hypothesis_context, retrieval_score
+    # Outcome context: reward observed for each action in the retrieved neighborhood.
+    # graph.actions holds action indices (-1 for empty slots -> all-zero one-hot row).
+    action_one_hot = jax.nn.one_hot(graph.actions, config.num_actions, dtype=jnp.float32)
+    action_one_hot = action_one_hot * graph.valid.astype(jnp.float32)[:, None]
+    action_visits = mixed @ action_one_hot
+    action_reward_mass = mixed @ (action_one_hot * graph.rewards[:, None])
+    action_outcome = jnp.where(
+        action_visits > eps, action_reward_mass / (action_visits + eps), 0.0
+    )
+    action_prior = (
+        config.graph_action_prior_weight * retrieval_score
+        * jnp.clip(action_outcome, -1.0, 1.0)
+    )
+    return embedding_context, attention_context, hypothesis_context, retrieval_score, action_prior
 
 
 def _agent_communicate(hiddens: jax.Array, active_mask: jax.Array, params: SwarmParams) -> jax.Array:
@@ -459,9 +475,8 @@ def _propose_kernel(
         jnp.asarray([novelty, uncertainty], jnp.float32),
     ))
     raw_embedding = jnp.tanh(global_features @ params.global_projection)
-    graph_embedding, graph_attention, graph_hypotheses, retrieval_score = _read_macrograph(
-        state.graph, raw_embedding, task_id, config
-    )
+    (graph_embedding, graph_attention, graph_hypotheses,
+     retrieval_score, action_prior) = _read_macrograph(state.graph, raw_embedding, task_id, config)
     graph_features = jnp.concatenate((graph_embedding, graph_attention, graph_hypotheses))
     shared = jnp.tanh(raw_embedding + graph_features @ params.graph_projection)
     keys = token_features @ params.key_projection
@@ -511,7 +526,7 @@ def _propose_kernel(
 
     # Pass 2: heads on interacted hiddens
     def heads(hidden, role_bias, action_bias):
-        action_values = hidden @ params.action_projection + action_bias
+        action_values = hidden @ params.action_projection + action_bias + action_prior
         masked_values = jnp.where(legal_mask, action_values, -1e9)
         action_probs = jax.nn.softmax(masked_values)
         proposed_action = jnp.argmax(masked_values).astype(jnp.int32)
@@ -560,6 +575,7 @@ def _propose_kernel(
         current_colors=current_colors.reshape((p,)),
         state_embedding=raw_embedding,
         retrieval_score=retrieval_score,
+        action_prior=action_prior,
     )
 
 
@@ -708,14 +724,21 @@ def _feedback_kernel(
     reliability = jnp.where(proposals.active_mask, reliability, state.reliability)
     reliability = jnp.clip(reliability, 0.01, 1.0)
 
-    # Policy / value / forecast updates
-    advantage = jnp.clip(reward - state.reward_baseline, -1.0, 1.0)
+    # Policy / value / forecast updates.
+    # Baseline = global reward EMA + state-conditioned residual evolved by QPSO.
+    learned_residual = jnp.dot(state_embedding, params.baseline_weights) + params.baseline_bias
+    value_baseline = state.reward_baseline + learned_residual
+    advantage = jnp.clip(reward - value_baseline, -1.0, 1.0)
     chosen_one_hot = jax.nn.one_hot(action, config.num_actions)
     policy_gradient = advantage * (chosen_one_hot[None, :] - proposals.action_probs)
     bias_update = config.policy_learning_rate * policy_gradient * active[:, None]
 
     def value_loss(action_projection):
-        values = proposals.agent_hidden @ action_projection + params.agent_action_bias
+        values = (
+            proposals.agent_hidden @ action_projection
+            + params.agent_action_bias
+            + proposals.action_prior[None, :]
+        )
         errors = values[:, action] - reward
         return 0.5 * jnp.sum(jnp.square(errors) * active) / (jnp.sum(active) + eps)
 
@@ -752,7 +775,7 @@ def _feedback_kernel(
     prediction_error = jnp.sum(per_agent_ce * active) / (jnp.sum(active) + eps)
 
     # Surprise for emotional encoding
-    surprise = jnp.clip(jnp.abs(reward - state.reward_baseline) + prediction_error, 0.0, 1.0)
+    surprise = jnp.clip(jnp.abs(reward - value_baseline) + prediction_error, 0.0, 1.0)
 
     graph = _write_graph(
         state.graph, proposals, decision, action, reward, task_id,
@@ -1014,6 +1037,8 @@ class JAXProposalSwarm:
             emotional,
             features=self._pending_memory_features,
         )
+        # EMA in effect when this decision was evaluated; QPSO fits the residual on top of it.
+        pre_feedback_baseline = self.state.reward_baseline
         self.params, self.state = new_params, new_state
         self.quantum_memory.state = memory_state_after
 
@@ -1072,7 +1097,7 @@ class JAXProposalSwarm:
                 bw = vec[rb_dim:rb_dim + self.config.hidden_dim]
                 bb = vec[-1]
                 pred = jnp.dot(emb, bw) + bb
-                baseline_term = -jnp.abs(pred - reward_f)
+                baseline_term = -jnp.abs(pre_feedback_baseline + pred - reward_f)
                 alignment = 0.0
                 for r in range(self.num_roles):
                     pref = jax.nn.softmax(rtable[r])[chosen_hyp]
