@@ -98,6 +98,16 @@ class TrunkLearningTests(unittest.TestCase):
         self.assertAlmostEqual(float(surprise), expected, places=5)
         swarm.cancel_pending()
 
+    def test_relative_emotional_weight_tracks_recent_surprise(self):
+        swarm = adjudicator.JAXProposalSwarm(config())
+        weights = [swarm._emotional_weight(0.9) for _ in range(40)]  # steady high surprise
+        self.assertAlmostEqual(weights[0], 0.05 + 0.95 * 0.5, places=6)  # no history -> neutral
+        self.assertLess(abs(weights[-1] - 0.525), 0.1)  # steady surprise is not "special"
+        self.assertGreater(swarm._emotional_weight(1.0), 0.9)  # a spike stands out
+        self.assertLess(swarm._emotional_weight(0.2), 0.2)  # a calm step is down-weighted
+        absolute = adjudicator.JAXProposalSwarm(config(relative_emotional_weight=False))
+        self.assertAlmostEqual(absolute._emotional_weight(0.4), 0.15 + 0.85 * 0.4, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,6 +55,9 @@ class SwarmConfig:
     prediction_learning_rate: float = 0.001
     coordinate_learning_rate: float = 0.05
     trunk_learning_rate: float = 0.002
+    relative_emotional_weight: bool = True
+    surprise_ema_decay: float = 0.95
+    emotional_floor: float = 0.05
     trunk_grad_clip_norm: float = 1.0
     baseline_decay: float = 0.95
     quantum_memory_dim: int = 32
@@ -107,6 +110,7 @@ class SwarmConfig:
             "policy_learning_rate", "reliability_learning_rate",
             "value_learning_rate", "prediction_learning_rate", "coordinate_learning_rate",
             "trunk_learning_rate", "baseline_decay",
+            "surprise_ema_decay", "emotional_floor",
             "quantum_projection_learning_rate", "qpso_beta", "qpso_init_scale",
             "rotation_theta_max",
         ):
@@ -977,6 +981,9 @@ class JAXProposalSwarm:
         self._pending_memory_features: Optional[jax.Array] = None
         self.last_memory_features = jnp.zeros(2 * config.quantum_memory_dim + 8, jnp.float32)
         self.last_decision: Optional[Decision] = None
+        self._surprise_mean = 0.0
+        self._surprise_var = 0.0
+        self._surprise_count = 0
 
         # QPSO + role rotation
         self.num_roles = config.num_roles
@@ -1140,7 +1147,8 @@ class JAXProposalSwarm:
         # Quantum memory encode with surprise-modulated weight
         memory_amplitudes = self._pending_memory_amplitudes
         decision = pending.adjudication
-        emotional = float(np.clip(0.15 + 0.85 * float(jax.device_get(surprise)), 0.0, 1.0))
+        surprise_value = float(jax.device_get(surprise))
+        emotional = self._emotional_weight(surprise_value)
         memory_state_after = self.quantum_memory.candidate_encode(
             memory_amplitudes,
             int(jax.device_get(decision.action_index)) + 1,
@@ -1261,6 +1269,32 @@ class JAXProposalSwarm:
             "trunk_grad_norm": float(jax.device_get(diagnostics[3])),
         }
 
+    def _emotional_weight(self, surprise_value: float) -> float:
+        """Map surprise to an emotional weight in [emotional_floor, 1].
+
+        Relative mode scores surprise against the running mean/std of recent
+        surprise (sigmoid of the z-score), so a memory is weighted for being
+        more surprising than usual rather than for being stored early in learning.
+        """
+        cfg = self.config
+        if not cfg.relative_emotional_weight:
+            return float(np.clip(0.15 + 0.85 * surprise_value, 0.0, 1.0))
+        if self._surprise_count == 0:
+            z = 0.0
+        else:
+            z = (surprise_value - self._surprise_mean) / (np.sqrt(self._surprise_var) + 1e-3)
+        relative = 1.0 / (1.0 + np.exp(-np.clip(z, -8.0, 8.0)))
+        decay = cfg.surprise_ema_decay
+        delta = surprise_value - self._surprise_mean
+        if self._surprise_count == 0:
+            self._surprise_mean, self._surprise_var = surprise_value, 0.0
+        else:
+            self._surprise_mean += (1.0 - decay) * delta
+            self._surprise_var = decay * (self._surprise_var + (1.0 - decay) * delta * delta)
+        self._surprise_count += 1
+        return float(np.clip(cfg.emotional_floor + (1.0 - cfg.emotional_floor) * relative, 0.0, 1.0))
+
+
     def cancel_pending(self) -> None:
         if self._pending is None:
             return
@@ -1271,6 +1305,7 @@ class JAXProposalSwarm:
         self._pending_memory_amplitudes = None
         self._pending_memory_features = None
         self.last_decision = None
+
 
     def reset_episode(self, preserve_graph: bool = True, preserve_reliability: bool = True) -> None:
         if self._pending is not None:

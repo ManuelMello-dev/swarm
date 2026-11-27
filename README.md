@@ -26,6 +26,8 @@ The agent trunk now learns. Recurrence (`recurrent_projection`), token attention
 
 Surprise, which sets each memory's emotional weight, is `|reward - baseline| + prediction_error / ln(10)`, clipped to [0, 1]. Dividing the colour cross-entropy by ln 10 (its chance-level value for 10 colours) keeps prediction error from saturating surprise on its own, so emotional weights spread as forecasting improves.
 
+Emotional weight is relative by default (`relative_emotional_weight=True`): each step's surprise is scored against the running mean and standard deviation of recent surprise (`surprise_ema_decay`, default 0.95), passed through a sigmoid, and mapped to `[emotional_floor, 1]` (default floor 0.05). A memory is weighted for being more surprising than usual, not for being stored early in learning. Set `relative_emotional_weight=False` for the previous absolute rule `0.15 + 0.85 * surprise`.
+
 ## Tests
 
 Run the CPU JAX tests with:
